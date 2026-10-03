@@ -1,0 +1,55 @@
+# Build and local runtime data
+/target/
+/.tools/
+/dist/
+/data/
+/test-data/
+
+# Local reports, captures and source snapshots
+/evidence/
+/local-notes/
+/screenshots/
+/DiskHistory-source-*.zip
+/DiskHistory-*.zip
+/VolumeTrail-source-*.zip
+/VolumeTrail-*.zip
+
+# Disk indexes, exported scan status and crash logs
+*.db
+*.db-*
+*.db.*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+*.dmp
+*.dump
+/scan-*.json
+/stop-*.flag
+/config.json
+
+# Machine-local configuration and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.local.json
+*.local.toml
+credentials.json
+secrets.json
+.secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+.netrc
+.npmrc
+.pypirc
+
+# Generated Windows binaries
+*.exe
+*.dll
+*.pdb

@@ -1,0 +1,5 @@
+[build]
+jobs = 2
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes"]
