@@ -28,8 +28,20 @@ Incomplete coverage means the returned ranking includes only retained data.
 `folder.comparison` includes the selected directory's `allocated_delta_bytes`,
 `direct_delta_bytes` and `moved_delta_bytes`, even when it has no child directories.
 Direct changes are aggregates recorded at this directory level, including whole
-directory movement. Extension totals require retained per-file details and can
-therefore have shorter coverage than directory totals.
+directory movement. Legacy extension estimates require retained per-file details
+and can therefore have shorter coverage than directory totals.
+
+Starting with 0.2.2, extension totals are stored as directory/type aggregates,
+including file and directory moves. These survive per-file detail cleanup and
+count toward the history budget. `extension_intervals` and
+`complete_extension_intervals` describe their coverage. Legacy per-file estimates
+remain available where retained, but are explicitly incomplete for moves.
+Directory path filters compare ASCII case insensitively, matching folder lookup.
+
+Growth results include an `unresolved` summary even when pagination excludes its
+row. `[unresolved]` represents changes whose parent paths could not be resolved;
+it is not a filesystem path. Root folder/type totals include these contributions.
+Scanning attempts to read missing parent directory records before committing.
 
 A directory absent from the current index returns `current_index_present:false`
 and null current sizes; its historical comparison is still available. Current
@@ -41,6 +53,10 @@ time, whole-machine average CPU percentage and process peak working-set bytes.
 The average includes busy pauses. The peak belongs to the worker's lifetime,
 including previously scanned drives during the same automatic run. Old scan
 points have null performance; no measurements are reconstructed retroactively.
+
+New performance records also include `commit_phases` with preparation, entry
+updates, affected-folder updates and history aggregation durations. These include
+busy pauses within those phases and exclude final transaction commit overhead.
 
 Read-only SQL examples against `data/history.db`:
 

@@ -274,6 +274,20 @@ pub fn scan_volume(
             stage_record(&ntfs, &mut reader, store, &volume_id, id,
                 mode == ScanMode::Full, &mut pending, &mut counters.entry_reads)?;
         }
+        let mut tried_parents = HashSet::new();
+        loop {
+            let missing: Vec<_> = store.missing_parent_ids(&volume_id, mode == ScanMode::Full)?
+                .into_iter().filter(|id| tried_parents.insert(*id)).collect();
+            if missing.is_empty() { break; }
+            for id in missing {
+                load.wait_if_busy(cancelled, progress, "补全目录路径", processed)?;
+                counters.entry_reads += 1;
+                reader.invalidate();
+                if let Ok(Some(entry)) = read_entry(&ntfs, &mut reader, id) {
+                    if entry.is_dir { store.stage(Mutation::Upsert(entry))?; }
+                }
+            }
+        }
         let after = volume.journal()?;
         ensure!(after.id == start.id && after.first_usn <= next_usn,
             "USN journal gap before commit");

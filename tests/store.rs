@@ -1,5 +1,162 @@
 use volumetrail::{model::*, store::Store};
 
+fn directory(id: u64, parent: u64, name: &str) -> Entry {
+    Entry { id, parent, name: name.into(), is_dir: true, logical: 0, allocated: 0,
+        modified: 0, attributes: 0, links: vec![] }
+}
+
+fn child_file(id: u64, parent: u64, name: &str, size: u64) -> Entry {
+    Entry { id, parent, name: name.into(), is_dir: false, logical: size, allocated: size,
+        modified: 0, attributes: 0, links: vec![] }
+}
+
+#[test]
+fn extension_changes_follow_moves_resizes_and_case_insensitive_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("history.db")).unwrap();
+    let first = store.publish("C:\\", &[Mutation::Upsert(directory(20,5,"Left")),
+        Mutation::Upsert(directory(21,5,"Right")), Mutation::Upsert(child_file(30,20,"one.mp4",100))],
+        &outcome(ScanMode::Full,10)).unwrap();
+    let second = store.publish("C:\\", &[Mutation::Upsert(child_file(30,21,"one.zip",150))],
+        &outcome(ScanMode::Incremental,20)).unwrap();
+    let left = store.extensions_between_path("volume-A",first,second,"c:\\LEFT\\").unwrap();
+    assert_eq!(left.items, vec![(".mp4".into(),-100,1)]);
+    assert_eq!((left.complete_intervals,left.intervals),(1,1));
+    assert_eq!(store.extensions_between_path("volume-A",first,second,"c:\\right").unwrap().items,
+        vec![(".zip".into(),150,1)]);
+    assert_eq!(store.changes_count("volume-A",first,second,Some("c:\\left")).unwrap(),1);
+    assert_eq!(store.changes_between_path("volume-A",first,second,"c:\\RIGHT",50,0).unwrap().len(),1);
+    let third = store.publish("C:\\", &[Mutation::Upsert(child_file(30,21,"one.txt",150))],
+        &outcome(ScanMode::Incremental,30)).unwrap();
+    let types = store.extensions_between_path("volume-A",second,third,"C:\\Right").unwrap();
+    assert!(types.items.iter().any(|(ext,delta,_)| ext==".zip" && *delta == -150));
+    assert!(types.items.iter().any(|(ext,delta,_)| ext==".txt" && *delta == 150));
+    assert_eq!(types.items.iter().map(|(_,delta,_)| *delta).sum::<i128>(),0);
+}
+
+#[test]
+fn incremental_directory_changes_match_full_snapshots() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut incremental = Store::open(&dir.path().join("incremental.db")).unwrap();
+    let mut full = Store::open(&dir.path().join("full.db")).unwrap();
+    let snapshots = vec![
+        vec![directory(20,5,"A"),directory(21,20,"B"),directory(22,5,"Target"),
+            child_file(30,20,"one.bin",100),child_file(31,21,"two.txt",200),child_file(32,22,"three.mp4",300)],
+        vec![directory(20,22,"A"),directory(21,20,"B"),directory(22,5,"Target"),
+            child_file(30,20,"one.bin",150),child_file(31,21,"two.txt",200),child_file(32,22,"three.mp4",300)],
+        vec![directory(20,21,"A"),directory(21,5,"B"),directory(22,5,"Target"),
+            child_file(30,20,"one.bin",150),child_file(31,21,"two.txt",220),child_file(32,22,"three.mp4",300)],
+        vec![directory(20,21,"Renamed"),directory(21,5,"B"),directory(22,5,"Target"),
+            child_file(30,20,"one.bin",150),child_file(31,21,"two.txt",220),child_file(32,20,"three.mp4",320)],
+        vec![directory(21,5,"B"),directory(22,5,"Target"),child_file(31,21,"two.txt",220)],
+        vec![directory(21,5,"B"),directory(22,5,"Target"),child_file(31,21,"two.txt",220),child_file(33,99,"orphan.dat",50)],
+        vec![directory(21,5,"B"),directory(22,5,"Target"),directory(99,22,"Recovered"),
+            child_file(31,21,"two.txt",220),child_file(33,99,"orphan.dat",50)],
+    ];
+    let mut previous: Vec<Entry> = Vec::new();
+    let mut prev_inc = 0;
+    let mut prev_full = 0;
+    for (index, entries) in snapshots.into_iter().enumerate() {
+        let mut changes: Vec<_> = entries.iter().filter(|e| !previous.contains(e)).cloned().map(Mutation::Upsert).collect();
+        for old in &previous {
+            if !entries.iter().any(|e| e.id == old.id) { changes.push(Mutation::Delete(old.id)); }
+        }
+        // USN can include a child whose contents did not change while its ancestor moved.
+        if index == 1 { changes.push(Mutation::Upsert(entries.iter().find(|e| e.id==31).unwrap().clone())); }
+        let usn = (index as i64 + 1)*10;
+        let inc_id = incremental.publish("C:\\",&changes,
+            &outcome(if index==0 { ScanMode::Full } else { ScanMode::Incremental },usn)).unwrap();
+        let full_id = full.publish("C:\\",&entries.iter().cloned().map(Mutation::Upsert).collect::<Vec<_>>(),
+            &outcome(ScanMode::Full,usn)).unwrap();
+        assert_eq!(incremental.totals("volume-A").unwrap(),full.totals("volume-A").unwrap());
+        for id in [5,20,21,22,99] {
+            assert_eq!(incremental.folder_stats("volume-A",id).unwrap(),full.folder_stats("volume-A",id).unwrap(),
+                "snapshot {index}, folder {id}");
+        }
+        if index>0 {
+            let growth = |store: &Store,from,to| store.folder_growth("volume-A",from,to,10).unwrap()
+                .into_iter().map(|item|(item.path,item.allocated_delta,item.moved_delta)).collect::<Vec<_>>();
+            assert_eq!(growth(&incremental,prev_inc,inc_id),growth(&full,prev_full,full_id),"snapshot {index}");
+            for path in ["C:\\","c:\\B","C:\\Target"] {
+                let types = |store: &Store,from,to| {
+                    let mut items: Vec<_> = store.extensions_between_path("volume-A",from,to,path).unwrap().items
+                        .into_iter().filter(|(_,delta,_)| *delta!=0).map(|(ext,delta,_)|(ext,delta)).collect();
+                    items.sort(); items
+                };
+                assert_eq!(types(&incremental,prev_inc,inc_id),types(&full,prev_full,full_id),"snapshot {index}, {path}");
+            }
+        }
+        previous = entries;
+        prev_inc = inc_id;
+        prev_full = full_id;
+    }
+}
+
+#[test]
+fn extension_history_survives_detail_cleanup_and_deleted_intermediate_points() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("history.db")).unwrap();
+    let first = store.publish("C:\\", &[file(30,"a.bin",10)], &outcome(ScanMode::Full,10)).unwrap();
+    let middle = store.publish("C:\\", &[file(30,"a.bin",20)], &outcome(ScanMode::Incremental,20)).unwrap();
+    let last = store.publish("C:\\", &[file(30,"a.bin",25)], &outcome(ScanMode::Incremental,30)).unwrap();
+    store.clear_details(&[middle,last]).unwrap();
+    store.delete_scans(&[middle]).unwrap();
+    let types=store.extensions_between_path("volume-A",first,last,"C:\\").unwrap();
+    assert_eq!(types.items,vec![(".bin".into(),15,2)]);
+    assert_eq!(types.complete_intervals,1);
+    store.delete_scans(&[last]).unwrap();
+    let next=store.publish("C:\\", &[file(30,"a.bin",28)], &outcome(ScanMode::Incremental,40)).unwrap();
+    assert_eq!(store.extensions_between_path("volume-A",first,next,"C:\\").unwrap().items,
+        vec![(".bin".into(),18,3)]);
+    store.prune(1).unwrap();
+    let types=store.extensions_between_path("volume-A",first,next,"C:\\").unwrap();
+    assert!(types.items.is_empty());
+    assert_eq!(types.complete_intervals,0);
+}
+
+#[test]
+fn legacy_extension_coverage_is_explicit_and_carries_forward() {
+    let dir=tempfile::tempdir().unwrap();
+    let path=dir.path().join("history.db");
+    let mut store=Store::open(&path).unwrap();
+    let first=store.publish("C:\\", &[file(30,"a.bin",10)], &outcome(ScanMode::Full,10)).unwrap();
+    let legacy=store.publish("C:\\", &[file(30,"a.bin",20)], &outcome(ScanMode::Incremental,20)).unwrap();
+    let db=rusqlite::Connection::open(&path).unwrap();
+    db.execute("DELETE FROM extension_changes WHERE scan=?",[legacy]).unwrap();
+    db.execute("UPDATE scans SET extensions_complete=0 WHERE id=?",[legacy]).unwrap();
+    let types=store.extensions_between_path("volume-A",first,legacy,"c:\\").unwrap();
+    assert_eq!(types.complete_intervals,0);
+    assert_eq!(types.items[0].1,10);
+    store.delete_scans(&[legacy]).unwrap();
+    let next=store.publish("C:\\", &[file(30,"a.bin",25)], &outcome(ScanMode::Incremental,30)).unwrap();
+    let types=store.extensions_between_path("volume-A",first,next,"C:\\").unwrap();
+    assert_eq!(types.complete_intervals,0);
+    assert_eq!(types.items[0].1,5);
+}
+
+#[test]
+fn unresolved_growth_remains_visible_and_missing_parents_can_be_repaired() {
+    let dir=tempfile::tempdir().unwrap();
+    let mut store=Store::open(&dir.path().join("history.db")).unwrap();
+    let first=store.publish("C:\\", &[], &outcome(ScanMode::Full,10)).unwrap();
+    let second=store.publish("C:\\", &[Mutation::Upsert(child_file(30,99,"a.bin",100))],
+        &outcome(ScanMode::Incremental,20)).unwrap();
+    let growth=store.folder_growth("volume-A",first,second,5).unwrap();
+    assert_eq!((growth[0].path.as_str(),growth[0].allocated_delta),("[unresolved]",100));
+    assert_eq!(store.folder_breakdown("volume-A",first,second,"C:\\").unwrap().allocated_delta,100);
+    store.begin_stage().unwrap();
+    assert!(store.missing_parent_ids("volume-A",false).unwrap().contains(&99));
+    store.stage(Mutation::Upsert(directory(99,5,"Recovered"))).unwrap();
+    assert!(!store.missing_parent_ids("volume-A",false).unwrap().contains(&99));
+    store.discard_stage().unwrap();
+    let third=store.publish("C:\\", &[Mutation::Upsert(directory(99,5,"Recovered"))],
+        &outcome(ScanMode::Incremental,30)).unwrap();
+    let growth=store.folder_growth("volume-A",second,third,5).unwrap();
+    assert!(growth.iter().any(|g|g.path=="[unresolved]" && g.allocated_delta == -100));
+    assert!(growth.iter().any(|g|g.path=="C:\\Recovered" && g.allocated_delta == 100));
+    assert_eq!(store.folder_stats("volume-A",5).unwrap().1,100);
+}
+
 fn file(id: u64, name: &str, size: u64) -> Mutation {
     Mutation::Upsert(Entry {
         id, parent: 5, name: name.into(), is_dir: false,

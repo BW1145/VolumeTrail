@@ -2,13 +2,14 @@ use crate::model::*;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
-use std::{collections::HashMap, fs, path::{Path, PathBuf}, time::Duration};
+use std::{collections::{HashMap, HashSet}, fs, path::{Path, PathBuf}, time::{Duration, Instant}};
 
 pub struct Store {
     db: Connection,
     path: PathBuf,
     staging: bool,
     cancel_path: Option<PathBuf>,
+    pub commit_timings: CommitTimings,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +76,13 @@ pub struct FolderBreakdown {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+pub struct ExtensionBreakdown {
+    pub items: Vec<(String, i128, u64)>,
+    pub intervals: u64,
+    pub complete_intervals: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct StorageUsage {
     pub history_bytes: u64,
     pub index_bytes: u64,
@@ -87,6 +95,7 @@ pub struct StorageUsage {
 type Directories = HashMap<u64, (u64, String)>;
 type FolderDeltas = HashMap<u64, (i128, i128, i128)>;
 type GrowthDeltas = HashMap<String, (i128, i128, u64)>;
+type ExtensionDeltas = HashMap<(String, String), (i128, u64)>;
 
 impl Store {
     pub fn open_read_only(path: &Path) -> Result<Self> {
@@ -94,7 +103,7 @@ impl Store {
         db.busy_timeout(Duration::from_secs(3))?;
         ensure!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? >= 2,
             "History database needs a one-time upgrade; open VolumeTrail first");
-        Ok(Self { db, path: path.to_path_buf(), staging: false, cancel_path: None })
+        Ok(Self { db, path: path.to_path_buf(), staging: false, cancel_path: None, commit_timings: CommitTimings::default() })
     }
 
     pub fn data_version(&self) -> Result<i64> {
@@ -214,7 +223,22 @@ impl Store {
                 PRAGMA user_version=6;
                 COMMIT;")?;
         }
-        Ok(Self { db, path: path.to_path_buf(), staging: false, cancel_path: None })
+        if db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? < 7 {
+            db.execute_batch("BEGIN IMMEDIATE;
+                ALTER TABLE scans ADD COLUMN extensions_complete INTEGER NOT NULL DEFAULT 0;
+                CREATE TABLE extension_changes(
+                    scan INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                    path TEXT NOT NULL, extension TEXT NOT NULL, delta INTEGER NOT NULL,
+                    events INTEGER NOT NULL, PRIMARY KEY(scan,path,extension));
+                CREATE TABLE carry_extensions(
+                    volume TEXT NOT NULL, path TEXT NOT NULL, extension TEXT NOT NULL,
+                    delta INTEGER NOT NULL, events INTEGER NOT NULL,
+                    PRIMARY KEY(volume,path,extension));
+                CREATE TABLE carry_extension_quality(volume TEXT PRIMARY KEY, complete INTEGER NOT NULL);
+                CREATE INDEX nodes_directories ON nodes(volume,id,parent,name) WHERE is_dir=1;
+                PRAGMA user_version=7; COMMIT;")?;
+        }
+        Ok(Self { db, path: path.to_path_buf(), staging: false, cancel_path: None, commit_timings: CommitTimings::default() })
     }
 
     pub fn set_cancel_path(&mut self, path: PathBuf) { self.cancel_path = Some(path); }
@@ -248,6 +272,33 @@ impl Store {
             "SELECT payload FROM nodes WHERE volume=? AND id=?", params![volume, id as i64],
             |r| r.get(0)).optional()?;
         payload.map(|json| serde_json::from_str(&json).map_err(Into::into)).transpose()
+    }
+
+    pub fn missing_parent_ids(&self, volume: &str, full: bool) -> Result<Vec<u64>> {
+        let mut candidates = HashSet::new();
+        let mut staged = HashSet::new();
+        let mut stmt = self.db.prepare("SELECT id,payload FROM staging")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            staged.insert(row.get::<_,i64>(0)? as u64);
+            if let Some(payload) = row.get::<_,Option<String>>(1)? {
+                let entry: Entry = serde_json::from_str(&payload)?;
+                if entry.parent != entry.id { candidates.insert(entry.parent); }
+            }
+        }
+        if !full {
+            let mut stmt = self.db.prepare("SELECT f.id FROM folders f LEFT JOIN nodes n ON f.volume=n.volume AND f.id=n.id
+                WHERE f.volume=? AND n.id IS NULL")?;
+            for row in stmt.query_map([volume], |r| r.get::<_,i64>(0))? { candidates.insert(row? as u64); }
+        }
+        let mut known = self.db.prepare("SELECT EXISTS(SELECT 1 FROM nodes WHERE volume=? AND id=? AND is_dir=1)")?;
+        let mut missing = Vec::new();
+        for id in candidates {
+            if !staged.contains(&id) && (full || !known.query_row(params![volume,id as i64], |r| r.get::<_,bool>(0))?) {
+                missing.push(id);
+            }
+        }
+        Ok(missing)
     }
 
     pub fn report_warnings(&self, id: i64) -> Result<Vec<String>> {
@@ -331,8 +382,9 @@ impl Store {
         }
     }
 
-    fn apply_stage(&self, root: &str, outcome: &ScanOutcome,
+    fn apply_stage(&mut self, root: &str, outcome: &ScanOutcome,
         control: &mut dyn FnMut() -> Result<()>) -> Result<i64> {
+        let preparing = Instant::now();
         let cp = &outcome.checkpoint;
         let old_cp = self.checkpoint(root)?;
         if outcome.mode == ScanMode::Incremental {
@@ -346,7 +398,7 @@ impl Store {
         let mut new_dirs = if outcome.mode == ScanMode::Full { HashMap::new() } else { old_dirs.clone() };
         let mut folder_deltas = FolderDeltas::new();
         let mut growth = GrowthDeltas::new();
-        let mut rebuild_folders = outcome.mode == ScanMode::Full;
+        let mut extensions = ExtensionDeltas::new();
         let mut staged = self.db.prepare("SELECT id,payload FROM staging")?;
         let mut rows = staged.query([])?;
         let mut index = 0;
@@ -360,14 +412,18 @@ impl Store {
             } else { new_dirs.remove(&id); }
         }
         drop(rows);
-        let moved_dirs: Vec<u64> = old_dirs.iter().filter_map(|(id, old)| {
-            new_dirs.get(id).filter(|new| *new != old).map(|_| *id)
-        }).filter(|id| !moved_ancestor(*id, &old_dirs, &new_dirs)).collect();
-        let old_moved: Vec<_> = moved_dirs.iter().map(|id| {
-            let old = self.db.query_row("SELECT allocated FROM folders WHERE volume=? AND id=?",
-                params![cp.volume_id, *id as i64], |r| r.get::<_, i64>(0)).optional()?.unwrap_or(0);
-            Ok((*id, old))
-        }).collect::<Result<Vec<_>>>()?;
+        let changed_dirs: HashSet<u64> = old_dirs.keys().chain(new_dirs.keys()).copied()
+            .filter(|id| old_dirs.get(id) != new_dirs.get(id)).collect();
+        self.db.execute_batch("CREATE TEMP TABLE IF NOT EXISTS changed_directories(id INTEGER PRIMARY KEY); DELETE FROM changed_directories;")?;
+        for id in &changed_dirs {
+            self.db.prepare_cached("INSERT INTO changed_directories VALUES(?)")?.execute([*id as i64])?;
+        }
+        if had_baseline && outcome.mode == ScanMode::Incremental && !changed_dirs.is_empty() {
+            self.unchanged_subtree_changes(&cp.volume_id, root, cp.root_id, &old_dirs, &new_dirs,
+                -1, &mut extensions, &mut growth, control)?;
+        }
+        self.commit_timings.prepare_ms = preparing.elapsed().as_millis() as u64;
+        let entries_started = Instant::now();
         let scan: i64 = self.db.query_row("SELECT next FROM scan_ids", [], |r| r.get(0))?;
         self.db.execute("UPDATE scan_ids SET next=next+1", [])?;
         self.db.execute("INSERT INTO scans(id,root,volume,finished,mode,total,free,logical,allocated,file_count,warnings,sampled,details,aggregate) VALUES(?,?,?,?,?,?,?,0,0,0,?,?,1,2)",
@@ -392,8 +448,9 @@ impl Store {
                 }
                 if had_baseline {
                     self.record_change(scan, root, cp.root_id, Some(&old), None, &old_dirs, &new_dirs)?;
+                    extension_delta(&mut extensions, root, cp.root_id, Some(&old), &old_dirs, -1);
                     add_growth_for_file(&mut growth, root, cp.root_id, Some(&old), None,
-                        &old_dirs, &new_dirs, &moved_dirs);
+                        &old_dirs, &new_dirs);
                 }
             }
             self.db.execute("DELETE FROM nodes WHERE volume=? AND id NOT IN (SELECT id FROM staging WHERE payload IS NOT NULL)", [&cp.volume_id])?;
@@ -404,23 +461,17 @@ impl Store {
             if index % 512 == 0 { self.check_cancel()?; control()?; }
             index += 1;
             let id: i64 = row.get(0)?;
-            let old: Option<String> = self.db.query_row("SELECT payload FROM nodes WHERE volume=? AND id=?", params![cp.volume_id, id], |r| r.get(0)).optional()?;
+            let old: Option<String> = self.db.prepare_cached("SELECT payload FROM nodes WHERE volume=? AND id=?")?
+                .query_row(params![cp.volume_id, id], |r| r.get(0)).optional()?;
             let payload: Option<String> = row.get(1)?;
-            if old == payload { continue; }
+            if old == payload && changed_dirs.is_empty() { continue; }
             let old: Option<Entry> = old.map(|s| serde_json::from_str(&s)).transpose()?;
             let new: Option<Entry> = payload.as_ref().map(|s| serde_json::from_str(s)).transpose()?;
             if had_baseline {
                 self.record_change(scan, root, cp.root_id, old.as_ref(), new.as_ref(), &old_dirs, &new_dirs)?;
+                extension_change(&mut extensions, root, cp.root_id, old.as_ref(), new.as_ref(), &old_dirs, &new_dirs);
                 add_growth_for_file(&mut growth, root, cp.root_id, old.as_ref(), new.as_ref(),
-                    &old_dirs, &new_dirs, &moved_dirs);
-            }
-            let old_dir_parent = old.as_ref().filter(|entry| entry.is_dir).map(|entry| entry.parent);
-            let new_dir_parent = new.as_ref().filter(|entry| entry.is_dir).map(|entry| entry.parent);
-            if old_dir_parent != new_dir_parent && old.as_ref().is_some_and(|entry| entry.is_dir) {
-                let files: Option<i64> = self.db.query_row(
-                    "SELECT files FROM folders WHERE volume=? AND id=?",
-                    params![cp.volume_id, id], |r| r.get(0)).optional()?;
-                if files.unwrap_or(0) > 0 { rebuild_folders = true; }
+                    &old_dirs, &new_dirs);
             }
             let unchanged_file = matches!((&old, &new), (Some(a), Some(b))
                 if !a.is_dir && !b.is_dir && a.parent == b.parent
@@ -442,7 +493,7 @@ impl Store {
             if let Some(e) = new {
                 self.db.prepare_cached("INSERT INTO nodes VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(volume,id) DO UPDATE SET parent=excluded.parent,name=excluded.name,is_dir=excluded.is_dir,logical=excluded.logical,allocated=excluded.allocated,payload=excluded.payload")?
                     .execute(params![cp.volume_id, id, e.parent as i64, e.name, e.is_dir, e.logical as i64, e.allocated as i64, payload])?;
-            } else { self.db.execute("DELETE FROM nodes WHERE volume=? AND id=?", params![cp.volume_id, id])?; }
+            } else { self.db.prepare_cached("DELETE FROM nodes WHERE volume=? AND id=?")?.execute(params![cp.volume_id, id])?; }
         }
         let logical = i64::try_from(i128::from(old_total.0) + volume_delta.0)?;
         let allocated = i64::try_from(i128::from(old_total.1) + volume_delta.1)?;
@@ -456,21 +507,23 @@ impl Store {
                 outcome.free as i64, outcome.sampled_at])?;
         self.db.execute("INSERT INTO volumes VALUES(?,?,?) ON CONFLICT(root) DO UPDATE SET checkpoint=excluded.checkpoint,pending=excluded.pending",
             params![root, serde_json::to_string(cp)?, serde_json::to_string(&outcome.pending)?])?;
-        if rebuild_folders {
+        self.commit_timings.entries_ms = entries_started.elapsed().as_millis() as u64;
+        let folders_started = Instant::now();
+        if outcome.mode == ScanMode::Full {
             self.rebuild_folders(&cp.volume_id, cp.root_id, &new_dirs)?;
+        } else if !changed_dirs.is_empty() {
+            let mut affected: HashSet<u64> = folder_deltas.keys().copied().collect();
+            for id in &changed_dirs {
+                affected.extend(ancestors(*id, &old_dirs));
+                affected.extend(ancestors(*id, &new_dirs));
+            }
+            self.refresh_folder_totals(&cp.volume_id, affected, &new_dirs, control)?;
         } else {
             self.apply_folder_deltas(&cp.volume_id, folder_deltas)?;
         }
+        self.commit_timings.folders_ms = folders_started.elapsed().as_millis() as u64;
+        let history_started = Instant::now();
         if had_baseline {
-            for (id, old_size) in old_moved {
-                let new_size: i64 = self.db.query_row("SELECT allocated FROM folders WHERE volume=? AND id=?",
-                    params![cp.volume_id, id as i64], |r| r.get(0)).optional()?.unwrap_or(0);
-                let old_path = directory_path(root, cp.root_id, id, &old_dirs);
-                let new_path = directory_path(root, cp.root_id, id, &new_dirs);
-                let transferred = old_size.min(new_size);
-                growth_entry(&mut growth, old_path, -i128::from(old_size), -i128::from(transferred), 1);
-                growth_entry(&mut growth, new_path, i128::from(new_size), i128::from(transferred), 1);
-            }
             let mut carry = self.db.prepare("SELECT path,allocated_delta,moved_delta,events FROM carry_folders WHERE volume=?")?;
             let mut rows = carry.query([&cp.volume_id])?;
             while let Some(row) = rows.next()? {
@@ -480,9 +533,78 @@ impl Store {
             drop(rows);
             drop(carry);
         }
+        if had_baseline && outcome.mode == ScanMode::Incremental && !changed_dirs.is_empty() {
+            self.unchanged_subtree_changes(&cp.volume_id, root, cp.root_id, &new_dirs, &old_dirs,
+                1, &mut extensions, &mut growth, control)?;
+        }
         write_growth(&self.db, scan, &growth)?;
+        let mut insert = self.db.prepare("INSERT INTO extension_changes VALUES(?,?,?,?,?)")?;
+        for ((path, extension), (delta, events)) in extensions {
+            if delta != 0 {
+                insert.execute(params![scan, path, extension, i64::try_from(delta)?, events as i64])?;
+            }
+        }
+        self.db.execute("INSERT INTO extension_changes SELECT ?,path,extension,delta,events FROM carry_extensions
+            WHERE volume=? ON CONFLICT(scan,path,extension) DO UPDATE SET
+            delta=delta+excluded.delta,events=events+excluded.events", params![scan, cp.volume_id])?;
+        self.db.execute("UPDATE scans SET extensions_complete=COALESCE(
+            (SELECT complete FROM carry_extension_quality WHERE volume=?),1) WHERE id=?", params![cp.volume_id, scan])?;
+        self.db.execute("DELETE FROM carry_extensions WHERE volume=?", [&cp.volume_id])?;
+        self.db.execute("DELETE FROM carry_extension_quality WHERE volume=?", [&cp.volume_id])?;
         self.db.execute("DELETE FROM carry_folders WHERE volume=?", [&cp.volume_id])?;
+        self.commit_timings.history_ms = history_started.elapsed().as_millis() as u64;
         Ok(scan)
+    }
+
+    fn unchanged_subtree_changes(&self, volume: &str, root: &str, root_id: u64,
+        dirs: &Directories, other_dirs: &Directories, sign: i128,
+        result: &mut ExtensionDeltas, growth: &mut GrowthDeltas,
+        control: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        let mut stmt = self.db.prepare("WITH RECURSIVE subtree(id) AS (
+            SELECT id FROM changed_directories
+            UNION SELECT n.id FROM nodes n JOIN subtree p ON n.parent=p.id WHERE n.volume=? AND n.is_dir=1 AND n.id<>n.parent)
+            SELECT n.id,n.parent,n.name,n.allocated FROM nodes n JOIN subtree p ON n.parent=p.id
+            WHERE n.volume=? AND n.is_dir=0 AND n.id NOT IN (SELECT id FROM staging)")?;
+        let mut rows = stmt.query(params![volume, volume])?;
+        let mut count = 0;
+        while let Some(row) = rows.next()? {
+            if count % 512 == 0 { self.check_cancel()?; control()?; }
+            count += 1;
+            let entry = Entry { id: row.get::<_, i64>(0)? as u64, parent: row.get::<_, i64>(1)? as u64,
+                name: row.get(2)?, allocated: row.get::<_, i64>(3)? as u64, is_dir: false,
+                logical: 0, modified: 0, attributes: 0, links: vec![] };
+            let path = entry_path(root, root_id, &entry, dirs);
+            if path == entry_path(root, root_id, &entry, other_dirs) { continue; }
+            extension_delta(result, root, root_id, Some(&entry), dirs, sign);
+            if let Some(parent) = folder_parent(&path) {
+                let delta = sign * i128::from(entry.allocated);
+                growth_entry(growth, parent, delta, delta, 1);
+            }
+        }
+        Ok(())
+    }
+
+    fn refresh_folder_totals(&self, volume: &str, affected: HashSet<u64>, dirs: &Directories,
+        control: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        let mut affected: Vec<_> = affected.into_iter().map(|id| (ancestors(id, dirs).len(), id)).collect();
+        affected.sort_unstable_by(|a, b| b.cmp(a));
+        let mut read = self.db.prepare("SELECT
+            COALESCE(SUM(CASE WHEN n.is_dir=0 THEN n.logical ELSE COALESCE(f.logical,0) END),0),
+            COALESCE(SUM(CASE WHEN n.is_dir=0 THEN n.allocated ELSE COALESCE(f.allocated,0) END),0),
+            COALESCE(SUM(CASE WHEN n.is_dir=0 THEN 1 ELSE COALESCE(f.files,0) END),0)
+            FROM nodes n LEFT JOIN folders f ON n.volume=f.volume AND n.id=f.id
+            WHERE n.volume=? AND n.parent=? AND n.id<>n.parent")?;
+        let mut write = self.db.prepare("INSERT INTO folders VALUES(?,?,?,?,?) ON CONFLICT(volume,id)
+            DO UPDATE SET logical=excluded.logical,allocated=excluded.allocated,files=excluded.files")?;
+        for (index, (_, id)) in affected.into_iter().enumerate() {
+            if index % 128 == 0 { self.check_cancel()?; control()?; }
+            let (logical, allocated, files): (i64,i64,i64) = read.query_row(params![volume,id as i64],
+                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            if files == 0 {
+                self.db.prepare_cached("DELETE FROM folders WHERE volume=? AND id=?")?.execute(params![volume,id as i64])?;
+            } else { write.execute(params![volume,id as i64,logical,allocated,files])?; }
+        }
+        Ok(())
     }
 
     fn apply_folder_deltas(&self, volume: &str, deltas: FolderDeltas) -> Result<()> {
@@ -589,7 +711,7 @@ impl Store {
             let prefix = format!("{}\\", path.trim_end_matches('\\'));
             self.db.query_row("SELECT COUNT(*) FROM changes c JOIN scans s ON s.id=c.scan
                 WHERE s.volume=? AND c.scan>? AND c.scan<=? AND
-                (substr(c.old_path,1,length(?))=? OR substr(c.new_path,1,length(?))=?)",
+                (substr(c.old_path,1,length(?))=? COLLATE NOCASE OR substr(c.new_path,1,length(?))=? COLLATE NOCASE)",
                 params![volume, from, to, prefix, prefix, prefix, prefix], |r| r.get(0))?
         } else {
             self.db.query_row("SELECT COUNT(*) FROM changes c JOIN scans s ON s.id=c.scan
@@ -606,7 +728,7 @@ impl Store {
             "SELECT c.old_path,c.new_path,c.logical_delta,c.allocated_delta,c.kind
              FROM changes c JOIN scans s ON s.id=c.scan
              WHERE s.volume=? AND c.scan>? AND c.scan<=? AND
-             (substr(c.old_path,1,length(?))=? OR substr(c.new_path,1,length(?))=?)
+             (substr(c.old_path,1,length(?))=? COLLATE NOCASE OR substr(c.new_path,1,length(?))=? COLLATE NOCASE)
              ORDER BY ABS(c.allocated_delta) DESC,ABS(c.logical_delta) DESC LIMIT ? OFFSET ?")?;
         Ok(stmt.query_map(params![volume, from, to, prefix, prefix, prefix, prefix,
             limit.min(5000) as i64, offset as i64], |r| Ok(Change {
@@ -616,14 +738,32 @@ impl Store {
     }
 
     pub fn extensions_between_path(&self, volume: &str, from: i64, to: i64,
-        path: &str) -> Result<Vec<(String, i128, u64)>> {
+        path: &str) -> Result<ExtensionBreakdown> {
+        let path = if path.len() == 3 { path } else { path.trim_end_matches('\\') };
         let prefix = format!("{}\\", path.trim_end_matches('\\'));
-        let mut stmt = self.db.prepare(
+        let version: i64 = self.db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let intervals: u64 = self.db.query_row("SELECT COUNT(*) FROM scans WHERE volume=? AND id>? AND id<=?",
+            params![volume,from,to], |r| r.get(0))?;
+        let mut complete_intervals = 0;
+        let mut grouped: HashMap<String, (i128, u64)> = HashMap::new();
+        if version >= 7 {
+            complete_intervals = self.db.query_row("SELECT COUNT(*) FROM scans WHERE volume=? AND id>? AND id<=? AND extensions_complete=1",
+                params![volume,from,to], |r| r.get(0))?;
+            let mut stmt = self.db.prepare("SELECT e.extension,SUM(e.delta),SUM(e.events) FROM extension_changes e
+                JOIN scans s ON e.scan=s.id WHERE s.volume=? AND e.scan>? AND e.scan<=? AND
+                (e.path=? COLLATE NOCASE OR substr(e.path,1,length(?))=? COLLATE NOCASE
+                    OR (?=3 AND e.path LIKE '[unresolved #%')) GROUP BY e.extension")?;
+            let mut rows = stmt.query(params![volume,from,to,path,prefix,prefix,path.len() as i64])?;
+            while let Some(row) = rows.next()? {
+                grouped.insert(row.get(0)?, (i128::from(row.get::<_,i64>(1)?),row.get::<_,i64>(2)? as u64));
+            }
+        }
+        let legacy = if version >= 7 { " AND s.extensions_complete=0" } else { "" };
+        let mut stmt = self.db.prepare(&format!(
             "SELECT c.old_path,c.new_path,c.allocated_delta FROM changes c JOIN scans s ON s.id=c.scan
              WHERE s.volume=? AND c.scan>? AND c.scan<=? AND c.allocated_delta<>0 AND
-             (substr(c.old_path,1,length(?))=? OR substr(c.new_path,1,length(?))=?)")?;
+             (substr(c.old_path,1,length(?))=? COLLATE NOCASE OR substr(c.new_path,1,length(?))=? COLLATE NOCASE){legacy}"))?;
         let mut rows = stmt.query(params![volume, from, to, prefix, prefix, prefix, prefix])?;
-        let mut grouped: HashMap<String, (i128, u64)> = HashMap::new();
         while let Some(row) = rows.next()? {
             let old: String = row.get(0)?;
             let new: String = row.get(1)?;
@@ -638,7 +778,7 @@ impl Store {
         }
         let mut items: Vec<_> = grouped.into_iter().map(|(extension, (delta, count))| (extension, delta, count)).collect();
         items.sort_by(|a, b| b.1.abs().cmp(&a.1.abs()));
-        Ok(items)
+        Ok(ExtensionBreakdown { items, intervals, complete_intervals })
     }
 
     pub fn folder_growth(&self, volume: &str, from: i64, to: i64, depth: usize) -> Result<Vec<FolderGrowth>> {
@@ -655,7 +795,7 @@ impl Store {
                     i128::from(row.get::<_, i64>(2)?), row.get::<_, i64>(3)? as u64);
             }
         }
-        let mut result: Vec<_> = grouped.into_iter().filter(|(_, (delta, _, _))| *delta != 0)
+        let mut result: Vec<_> = grouped.into_iter().filter(|(path, (delta, _, _))| *delta != 0 || path == "[unresolved]")
             .map(|(path, (allocated_delta, moved_delta, changes))| FolderGrowth { path, allocated_delta, moved_delta, changes })
             .collect();
         result.sort_by(|a, b| b.allocated_delta.cmp(&a.allocated_delta).then_with(|| a.path.cmp(&b.path)));
@@ -669,8 +809,9 @@ impl Store {
         let mut stmt = self.db.prepare("SELECT f.path,f.allocated_delta,f.moved_delta,f.events
             FROM folder_changes f JOIN scans s ON s.id=f.scan
             WHERE s.volume=? AND f.scan>? AND f.scan<=? AND
-            (f.path=? COLLATE NOCASE OR substr(f.path,1,length(?))=? COLLATE NOCASE)")?;
-        let mut rows = stmt.query(params![volume, from, to, path, prefix, prefix])?;
+            (f.path=? COLLATE NOCASE OR substr(f.path,1,length(?))=? COLLATE NOCASE
+                OR (?=3 AND f.path LIKE '[unresolved #%'))")?;
+        let mut rows = stmt.query(params![volume, from, to, path, prefix, prefix, path.len() as i64])?;
         let mut result = FolderBreakdown::default();
         let mut children = GrowthDeltas::new();
         while let Some(row) = rows.next()? {
@@ -745,13 +886,18 @@ impl Store {
         ordered.sort_unstable();
         ordered.dedup();
         for id in ordered {
-            let current: Option<(String, i64)> = tx.query_row("SELECT volume,aggregate FROM scans WHERE id=?", [id],
-                |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-            let Some((volume, quality)) = current else { continue; };
+            let current: Option<(String, i64, i64)> = tx.query_row("SELECT volume,aggregate,extensions_complete FROM scans WHERE id=?", [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+            let Some((volume, quality, extension_quality)) = current else { continue; };
             let previous: Option<i64> = tx.query_row("SELECT MAX(id) FROM scans WHERE volume=? AND id<?", params![volume, id], |r| r.get(0))?;
             let next: Option<i64> = tx.query_row("SELECT MIN(id) FROM scans WHERE volume=? AND id>?", params![volume, id], |r| r.get(0))?;
             if previous.is_some() {
                 if let Some(next) = next {
+                    tx.execute("INSERT INTO extension_changes SELECT ?,path,extension,delta,events
+                        FROM extension_changes WHERE scan=? ON CONFLICT(scan,path,extension) DO UPDATE SET
+                        delta=delta+excluded.delta,events=events+excluded.events", params![next,id])?;
+                    tx.execute("UPDATE scans SET extensions_complete=CASE WHEN extensions_complete=1 AND ?=1 THEN 1 ELSE 2 END WHERE id=?",
+                        params![extension_quality,next])?;
                     tx.execute("INSERT INTO folder_changes SELECT ?,path,allocated_delta,moved_delta,events
                         FROM folder_changes WHERE scan=? ON CONFLICT(scan,path) DO UPDATE SET
                         allocated_delta=allocated_delta+excluded.allocated_delta,
@@ -759,6 +905,12 @@ impl Store {
                         params![next, id])?;
                     tx.execute("UPDATE scans SET aggregate=MIN(aggregate,?) WHERE id=?", params![quality, next])?;
                 } else {
+                    tx.execute("INSERT INTO carry_extensions SELECT ?,path,extension,delta,events
+                        FROM extension_changes WHERE scan=? ON CONFLICT(volume,path,extension) DO UPDATE SET
+                        delta=delta+excluded.delta,events=events+excluded.events", params![volume,id])?;
+                    tx.execute("INSERT INTO carry_extension_quality VALUES(?,?) ON CONFLICT(volume) DO UPDATE SET
+                        complete=CASE WHEN complete=1 AND excluded.complete=1 THEN 1 ELSE 2 END",
+                        params![volume,if extension_quality == 1 { 1 } else { 2 }])?;
                     tx.execute("INSERT INTO carry_folders SELECT ?,path,allocated_delta,moved_delta,events
                         FROM folder_changes WHERE scan=? ON CONFLICT(volume,path) DO UPDATE SET
                         allocated_delta=allocated_delta+excluded.allocated_delta,
@@ -767,6 +919,8 @@ impl Store {
                 }
             } else if next.is_none() {
                 tx.execute("DELETE FROM carry_folders WHERE volume=?", [&volume])?;
+                tx.execute("DELETE FROM carry_extensions WHERE volume=?", [&volume])?;
+                tx.execute("DELETE FROM carry_extension_quality WHERE volume=?", [&volume])?;
             }
             deleted += tx.execute("DELETE FROM scans WHERE id=?", [id])?;
         }
@@ -861,6 +1015,8 @@ impl Store {
             let oldest: Option<i64> = self.db.query_row("SELECT MIN(id) FROM scans WHERE aggregate<>0", [], |r| r.get(0))?;
             if let Some(id) = oldest {
                 self.db.execute("DELETE FROM folder_changes WHERE scan=?", [id])?;
+                self.db.execute("DELETE FROM extension_changes WHERE scan=?", [id])?;
+                self.db.execute("UPDATE scans SET extensions_complete=0 WHERE id=?", [id])?;
                 self.db.execute("UPDATE scans SET aggregate=0 WHERE id=?", [id])?;
                 continue;
             }
@@ -896,7 +1052,10 @@ impl Store {
     pub fn history_bytes(&self) -> Result<u64> {
         Ok(self.db.query_row("SELECT COALESCE(SUM(pgsize),0) FROM dbstat WHERE aggregate=TRUE
             AND name IN ('changes','changes_scan','folder_changes','sqlite_autoindex_folder_changes_1',
-                'carry_folders','sqlite_autoindex_carry_folders_1')", [], |row| row.get(0))?)
+                'carry_folders','sqlite_autoindex_carry_folders_1',
+                'extension_changes','sqlite_autoindex_extension_changes_1',
+                'carry_extensions','sqlite_autoindex_carry_extensions_1',
+                'carry_extension_quality','sqlite_autoindex_carry_extension_quality_1')", [], |row| row.get(0))?)
     }
 
     pub fn storage_usage(&self) -> Result<StorageUsage> {
@@ -931,6 +1090,7 @@ fn folder_parent(path: &str) -> Option<String> {
 }
 
 fn folder_bucket_dir(path: &str, depth: usize) -> Option<String> {
+    if path.starts_with("[unresolved #") { return Some("[unresolved]".into()); }
     let bytes = path.as_bytes();
     if bytes.len() < 3 || bytes[1] != b':' || bytes[2] != b'\\' { return None; }
     let parts: Vec<_> = path[3..].split('\\').filter(|part| !part.is_empty()).collect();
@@ -958,33 +1118,54 @@ fn write_growth(db: &Connection, scan: i64, growth: &GrowthDeltas) -> Result<()>
     Ok(())
 }
 
-fn directory_path(root: &str, root_id: u64, id: u64, dirs: &Directories) -> String {
-    if id == root_id { return root.to_owned(); }
-    let Some((parent, name)) = dirs.get(&id) else { return format!("[unresolved #{id}]"); };
-    entry_path(root, root_id, &Entry { id, parent: *parent, name: name.clone(), is_dir: true,
-        logical: 0, allocated: 0, modified: 0, attributes: 0, links: vec![] }, dirs)
-}
-
-fn is_descendant(mut parent: u64, ancestor: u64, dirs: &Directories) -> bool {
+fn ancestors(mut id: u64, dirs: &Directories) -> Vec<u64> {
+    let mut result = Vec::new();
     for _ in 0..1024 {
-        if parent == ancestor { return true; }
-        let Some((next, _)) = dirs.get(&parent) else { return false; };
-        if *next == parent { return false; }
-        parent = *next;
+        if result.contains(&id) { break; }
+        result.push(id);
+        let Some((parent, _)) = dirs.get(&id) else { break; };
+        id = *parent;
     }
-    false
+    result
 }
 
-fn moved_ancestor(id: u64, old: &Directories, new: &Directories) -> bool {
-    old.iter().any(|(candidate, before)| {
-        *candidate != id && new.get(candidate).is_some_and(|after| after != before)
-            && (is_descendant(id, *candidate, old) || is_descendant(id, *candidate, new))
-    })
+fn extension_delta(result: &mut ExtensionDeltas, root: &str, root_id: u64,
+    entry: Option<&Entry>, dirs: &Directories, sign: i128) {
+    let Some(entry) = entry.filter(|e| !e.is_dir && e.allocated != 0) else { return; };
+    let path = entry_path(root, root_id, entry, dirs);
+    let Some(parent) = folder_parent(&path) else { return; };
+    let extension = entry.name.rsplit_once('.').map(|(_, ext)| format!(".{}", ext.to_ascii_lowercase()))
+        .unwrap_or_else(|| "(无扩展名)".into());
+    let value = result.entry((parent, extension)).or_default();
+    value.0 += sign * i128::from(entry.allocated);
+    value.1 += 1;
+}
+
+fn extension_change(result: &mut ExtensionDeltas, root: &str, root_id: u64,
+    old: Option<&Entry>, new: Option<&Entry>, old_dirs: &Directories, new_dirs: &Directories) {
+    let key = |entry: &Entry, dirs: &Directories| {
+        let parent = folder_parent(&entry_path(root, root_id, entry, dirs));
+        let extension = entry.name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase());
+        (parent, extension)
+    };
+    if let (Some(old), Some(new)) = (old.filter(|e| !e.is_dir), new.filter(|e| !e.is_dir)) {
+        if key(old, old_dirs) == key(new, new_dirs) {
+            if old.allocated != new.allocated {
+                let mut change = new.clone();
+                change.allocated = old.allocated.abs_diff(new.allocated);
+                extension_delta(result, root, root_id, Some(&change), new_dirs,
+                    if new.allocated > old.allocated { 1 } else { -1 });
+            }
+            return;
+        }
+    }
+    extension_delta(result, root, root_id, old, old_dirs, -1);
+    extension_delta(result, root, root_id, new, new_dirs, 1);
 }
 
 fn add_growth_for_file(growth: &mut GrowthDeltas, root: &str, root_id: u64,
     old: Option<&Entry>, new: Option<&Entry>, old_dirs: &Directories,
-    new_dirs: &Directories, moved_dirs: &[u64]) {
+    new_dirs: &Directories) {
     let old = old.filter(|e| !e.is_dir);
     let new = new.filter(|e| !e.is_dir);
     if old.is_none() && new.is_none() { return; }
@@ -1004,18 +1185,14 @@ fn add_growth_for_file(growth: &mut GrowthDeltas, root: &str, root_id: u64,
         old.zip(new).map_or(0, |(a, b)| a.allocated.min(b.allocated))
     } else { 0 };
     if let (Some(entry), Some(path)) = (old, old_path.as_deref()) {
-        if !moved_dirs.iter().any(|id| is_descendant(entry.parent, *id, old_dirs)) {
             if let Some(parent) = folder_parent(path) {
                 growth_entry(growth, parent, -i128::from(entry.allocated), -i128::from(transfer), 1);
             }
-        }
     }
     if let (Some(entry), Some(path)) = (new, new_path.as_deref()) {
-        if !moved_dirs.iter().any(|id| is_descendant(entry.parent, *id, new_dirs)) {
             if let Some(parent) = folder_parent(path) {
                 growth_entry(growth, parent, i128::from(entry.allocated), i128::from(transfer), 1);
             }
-        }
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::{config::AppConfig, startup::{self, StartupStatus}, store::{Change, FolderBreakdown, FolderGrowth, FolderItem, RankedItem, Report, StorageUsage, Store}, worker};
+use crate::{config::AppConfig, startup::{self, StartupStatus}, store::{Change, ExtensionBreakdown, FolderBreakdown, FolderGrowth, FolderItem, RankedItem, Report, StorageUsage, Store}, worker};
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use eframe::egui::{self, Color32, RichText, Stroke};
@@ -39,11 +39,11 @@ pub struct VolumeTrailApp {
     growth: Vec<FolderGrowth>,
     compare_from: Option<i64>,
     comparison_key: Option<(i64, i64, u8, u64)>,
-    comparison_rx: Option<Receiver<((i64, i64, u8, u64), Result<(Vec<FolderGrowth>, Vec<Change>, (u64, u64, u64, u64), Vec<(String, i128, u64)>, u64, Option<FolderBreakdown>), String>)>>,
+    comparison_rx: Option<Receiver<((i64, i64, u8, u64), Result<(Vec<FolderGrowth>, Vec<Change>, (u64, u64, u64, u64), ExtensionBreakdown, u64, Option<FolderBreakdown>), String>)>>,
     comparison_coverage: Option<(u64, u64, u64, u64)>,
     comparison_path: Option<String>,
     comparison_breakdown: Option<FolderBreakdown>,
-    extensions: Vec<(String, i128, u64)>,
+    extensions: ExtensionBreakdown,
     details_page: u64,
     details_total: u64,
     folder_depth: u8,
@@ -100,7 +100,7 @@ impl VolumeTrailApp {
             history_selection: HashSet::new(), history_message: None, history_rx: None,
             changes: Vec::new(), growth: Vec::new(), compare_from: None,
             comparison_key: None, comparison_rx: None, comparison_coverage: None,
-            comparison_path: None, comparison_breakdown: None, extensions: Vec::new(), details_page: 0, details_total: 0,
+            comparison_path: None, comparison_breakdown: None, extensions: ExtensionBreakdown::default(), details_page: 0, details_total: 0,
             folder_depth: 5,
             folders: Vec::new(), largest_mode: None, largest_items: Vec::new(),
             largest_offset: 0, largest_key: None, largest_rx: None,
@@ -236,7 +236,7 @@ impl VolumeTrailApp {
                 let (changes, extensions) = if let Some(prefix) = selected_path.as_deref() {
                     (store.changes_between_path(&volume, from, to, prefix, 100, key.3 * 100)?,
                         store.extensions_between_path(&volume, from, to, prefix)?)
-                } else { (store.changes_between_page(&volume, from, to, 100, key.3 * 100)?, Vec::new()) };
+                } else { (store.changes_between_page(&volume, from, to, 100, key.3 * 100)?, ExtensionBreakdown::default()) };
                 Ok((growth, changes, store.coverage(&volume, from, to)?, extensions,
                     store.changes_count(&volume, from, to, selected_path.as_deref())?, breakdown))
             })().map_err(|error| format!("{error:#}"));
@@ -248,7 +248,7 @@ impl VolumeTrailApp {
         self.changes.clear();
         self.comparison_coverage = None;
         self.comparison_breakdown = None;
-        self.extensions.clear();
+        self.extensions = ExtensionBreakdown::default();
         self.details_total = 0;
     }
 
@@ -479,6 +479,13 @@ impl VolumeTrailApp {
                     performance.maintenance_ms.unwrap_or(0) as f64 / 1000.0));
                 ui.label(format!("变化事件 {} 条 · 涉及文件 {} 个 · 实际读取 {} 次",
                     performance.counters.journal_records, performance.counters.unique_changed_files, performance.counters.entry_reads));
+                if let Some(phases) = &performance.commit_phases {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("提交明细：准备 {:.1} 秒 · 文件 {:.1} 秒 · 目录 {:.1} 秒 · 历史 {:.1} 秒",
+                            phases.prepare_ms as f64 / 1000.0, phases.entries_ms as f64 / 1000.0,
+                            phases.folders_ms as f64 / 1000.0, phases.history_ms as f64 / 1000.0));
+                    });
+                }
                 if let Some(cpu) = performance.average_cpu_percent {
                     ui.label(format!("平均 CPU 占用 {:.2}%（整机口径） · CPU 用时 {:.2} 秒",
                         cpu, performance.cpu_time_ms.unwrap_or(0) as f64 / 1000.0));
@@ -681,7 +688,11 @@ impl VolumeTrailApp {
             }
             ui.label(RichText::new(if self.comparison_path.is_some() { "子文件夹变化" } else { "文件夹净增长排行" }).size(18.0).strong());
             ui.label(RichText::new("按已记录的文件占用变化汇总；点击目录查看构成").color(MUTED));
-            let growth: Vec<_> = self.growth.iter().filter(|item| item.allocated_delta > 0).take(12).cloned().collect();
+            for item in self.growth.iter().filter(|item| item.path == "[unresolved]") {
+                ui.colored_label(AMBER, format!("无法定位的变化 {} · {} 项",
+                    signed_bytes(item.allocated_delta), item.changes));
+            }
+            let growth: Vec<_> = self.growth.iter().filter(|item| item.allocated_delta > 0 && item.path != "[unresolved]").take(12).cloned().collect();
             if growth.is_empty() {
                 ui.label(if self.comparison_path.is_some() { "这段时间没有子文件夹净增长。" } else { "这段时间没有文件夹净增长。" });
             }
@@ -695,7 +706,7 @@ impl VolumeTrailApp {
                 }
                 if opened { self.open_path(&item.path, false); }
             }
-            let released: Vec<_> = self.growth.iter().rev().filter(|item| item.allocated_delta < 0).take(5).cloned().collect();
+            let released: Vec<_> = self.growth.iter().rev().filter(|item| item.allocated_delta < 0 && item.path != "[unresolved]").take(5).cloned().collect();
             if !released.is_empty() {
                 ui.add_space(12.0);
                 ui.label(RichText::new("释放空间最多").size(18.0).strong());
@@ -710,10 +721,14 @@ impl VolumeTrailApp {
                     if opened { self.open_path(&item.path, false); }
                 }
             }
-            if !self.extensions.is_empty() {
+            if self.extensions.intervals > 0 {
                 ui.add_space(12.0);
                 ui.label(RichText::new("文件类型变化").size(18.0).strong());
-                for (extension, delta, count) in self.extensions.iter().take(10) {
+                if self.extensions.complete_intervals < self.extensions.intervals {
+                    ui.colored_label(AMBER, format!("完整类型汇总覆盖 {}/{} 个区间；旧记录可能缺少移入移出",
+                        self.extensions.complete_intervals, self.extensions.intervals));
+                }
+                for (extension, delta, count) in self.extensions.items.iter().take(10) {
                     ui.label(format!("{}  {}  {} 项", extension, signed_bytes(*delta), count));
                 }
             }

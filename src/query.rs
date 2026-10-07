@@ -68,8 +68,13 @@ pub fn run(args: Vec<String>) -> Result<()> {
             let (intervals, complete, available, details) = store.coverage(volume, start, end)?;
             let mut items = store.folder_growth(volume, start, end, depth)?;
             if let Some(prefix) = path.as_deref() {
-                items.retain(|item| item.path == prefix || item.path.starts_with(&format!("{}\\", prefix.trim_end_matches('\\'))));
+                let prefix = prefix.trim_end_matches('\\').to_ascii_lowercase();
+                items.retain(|item| item.path.eq_ignore_ascii_case(&prefix)
+                    || (prefix.len() == 2 && item.path == "[unresolved]")
+                    || item.path.to_ascii_lowercase().starts_with(&format!("{prefix}\\")));
             }
+            let unresolved = items.iter().find(|item| item.path == "[unresolved]").map(|item| json!({
+                "allocated_delta_bytes":item.allocated_delta,"events":item.changes}));
             let total = items.len();
             let items = items.into_iter().skip(offset as usize).take(limit as usize).map(|item| json!({
                 "path":item.path,"allocated_delta_bytes":item.allocated_delta,
@@ -78,7 +83,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
             json!({"command":"growth","drive":root,"volume":volume,"from":start,"to":end,
                 "intervals":intervals,"complete_aggregate_intervals":complete,
                 "available_aggregate_intervals":available,"detail_intervals":details,
-                "depth":depth,"total":total,"offset":offset,"limit":limit,"items":items})
+                "depth":depth,"total":total,"offset":offset,"limit":limit,"items":items,"unresolved":unresolved})
         }
         "folder" => {
             let folder_path = path.unwrap_or_else(|| root.clone());
@@ -103,13 +108,14 @@ pub fn run(args: Vec<String>) -> Result<()> {
                     .take(limit as usize).map(|item| json!({"path":item.path,
                         "allocated_delta_bytes":item.allocated_delta,"moved_delta_bytes":item.moved_delta,
                         "events":item.changes})).collect::<Vec<_>>();
-                let extensions = store.extensions_between_path(volume, start, end, &folder_path)?
-                    .into_iter().take(10).map(|(extension, delta, events)| json!({
+                let types = store.extensions_between_path(volume, start, end, &folder_path)?;
+                let extensions = types.items.into_iter().take(10).map(|(extension, delta, events)| json!({
                         "extension":extension,"allocated_delta_bytes":delta,"events":events})).collect::<Vec<_>>();
                 Some(json!({"from":start,"to":end,"coverage":store.coverage(volume,start,end)?,
                     "allocated_delta_bytes":breakdown.allocated_delta,
                     "direct_delta_bytes":breakdown.direct_delta,"moved_delta_bytes":breakdown.moved_delta,
-                    "children":children,"extensions":extensions}))
+                    "children":children,"extensions":extensions,
+                    "extension_intervals":types.intervals,"complete_extension_intervals":types.complete_intervals}))
             } else { None };
             json!({"command":"folder","drive":root,"volume":volume,"path":folder_path,
                 "indexed_at":indexed_at,"current_index_present":id.is_some(),

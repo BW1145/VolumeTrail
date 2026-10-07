@@ -241,6 +241,7 @@ fn run_scan_locked(letter: char, data: &Path, budget: u64) -> Result<()> {
         average_cpu_percent: cpu_time_ms.and_then(|cpu| (duration_ms > 0).then(||
             cpu as f64 / duration_ms as f64 / std::thread::available_parallelism().map_or(1, |n| n.get()) as f64 * 100.0)),
         process_peak_working_set_bytes: process_peak_memory(),
+        commit_phases: result.as_ref().ok().map(|(_, store)| store.commit_timings.clone()),
     };
     if let Ok((id, store)) = &result {
         if let Err(error) = store.save_performance(*id, &performance) {

@@ -75,4 +75,14 @@ pub struct ScanPerformance {
     pub cpu_time_ms: Option<u64>,
     pub average_cpu_percent: Option<f64>,
     pub process_peak_working_set_bytes: Option<u64>,
+    #[serde(default)]
+    pub commit_phases: Option<CommitTimings>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CommitTimings {
+    pub prepare_ms: u64,
+    pub entries_ms: u64,
+    pub folders_ms: u64,
+    pub history_ms: u64,
 }

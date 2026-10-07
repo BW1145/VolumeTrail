@@ -33,7 +33,7 @@
 
 ## 开发
 
-使用 Rust、egui/eframe、SQLite 和 Windows API。当前版本为 0.2.1。
+使用 Rust、egui/eframe、SQLite 和 Windows API。当前版本为 0.2.2。
 
 从源码构建需要 Windows x64、Rust GNU 工具链和 LLVM-MinGW。
 完整的下载、校验、安装、测试和打包步骤见 [构建说明](docs/build.md)。
