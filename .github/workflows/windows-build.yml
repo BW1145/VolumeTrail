@@ -1,0 +1,62 @@
+name: Windows build and tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      CARGO_HOME: ${{ github.workspace }}\.tools\cargo
+      RUSTUP_HOME: ${{ github.workspace }}\.tools\rustup
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install project Rust toolchain
+        run: |
+          New-Item -ItemType Directory -Path .tools/tmp -Force | Out-Null
+          Invoke-WebRequest 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe' -OutFile .tools/rustup-init.exe
+          & ./.tools/rustup-init.exe -y --no-modify-path --profile minimal --default-host x86_64-pc-windows-gnu --default-toolchain 1.98.1
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed' }
+
+      - name: Install verified LLVM-MinGW
+        run: |
+          $archive = '.tools/llvm-mingw-20260908-msvcrt-x86_64.zip'
+          Invoke-WebRequest 'https://github.com/mstorsjo/llvm-mingw/releases/download/20260908/llvm-mingw-20260908-msvcrt-x86_64.zip' -OutFile $archive
+          $expected = '341cc9786b54956467ac19a02fdb00749307eac133da56108f643e4189db810b'
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $expected) {
+            throw 'LLVM-MinGW archive SHA-256 mismatch'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath .tools
+
+      - name: Test all application targets
+        run: ./build.ps1 test -CargoArgs '--locked','--all-targets'
+
+      - name: Build portable GUI and CLI
+        run: ./build.ps1 package
+
+      - name: Record artifact checksums and source commit
+        run: |
+          git rev-parse HEAD | Set-Content dist/VolumeTrail/COMMIT.txt -Encoding utf8
+          Get-ChildItem dist/VolumeTrail/*.exe | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
+          } | Set-Content dist/VolumeTrail/SHA256SUMS.txt -Encoding utf8
+
+      - name: Upload portable applications
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: VolumeTrail-windows-x64-${{ github.sha }}
+          path: dist/VolumeTrail/
+          if-no-files-found: error
+          retention-days: 14
