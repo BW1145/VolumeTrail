@@ -684,3 +684,73 @@ fn production_increment_replay_on_isolated_copy_when_requested() {
     store.commit_stage("C:\\", &sample).unwrap();
     println!("isolated commit of 14000 resized records: {:.2}s", start.elapsed().as_secs_f64());
 }
+
+#[test]
+fn absolute_folder_queries_normalize_roots_and_repeated_separators() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("history.db");
+    let mut store = Store::open(&db_path).unwrap();
+    let first = store.publish("C:\\", &[
+        Mutation::Upsert(directory(20, 5, "Cache")),
+        Mutation::Upsert(directory(21, 20, "子目录")),
+        Mutation::Upsert(directory(22, 5, "Cache-other")),
+        Mutation::Upsert(child_file(30, 5, "root.bin", 10)),
+        Mutation::Upsert(child_file(31, 21, "child.txt", 20)),
+        Mutation::Upsert(child_file(32, 22, "sibling.zip", 30)),
+    ], &outcome(ScanMode::Full, 10)).unwrap();
+    let second = store.publish("C:\\", &[
+        Mutation::Upsert(child_file(30, 5, "root.bin", 15)),
+        Mutation::Upsert(child_file(31, 21, "child.txt", 30)),
+        Mutation::Upsert(child_file(32, 22, "sibling.zip", 50)),
+        Mutation::Upsert(child_file(33, 99, "orphan.dat", 7)),
+    ], &outcome(ScanMode::Incremental, 20)).unwrap();
+    for path in ["C:\\", "c:\\\\", "C:\\\\\\\\"] {
+        assert_eq!(store.resolve_folder("volume-A", 5, path).unwrap(), 5);
+        let root = store.folder_breakdown("volume-A", first, second, path).unwrap();
+        assert_eq!((root.allocated_delta, root.direct_delta), (42, 5), "{path}");
+        assert_eq!(root.children.len(), 3);
+        assert_eq!(store.changes_count("volume-A", first, second, Some(path)).unwrap(), 3);
+        assert_eq!(store.changes_between_path("volume-A", first, second, path, 50, 0).unwrap().len(), 3);
+        let types = store.extensions_between_path("volume-A", first, second, path).unwrap();
+        assert_eq!(types.items.len(), 4);
+        assert_eq!(types.items.iter().map(|(_, delta, _)| *delta).sum::<i128>(), 42);
+    }
+    for path in ["c:\\CACHE\\", "C:\\\\Cache\\\\"] {
+        assert_eq!(store.resolve_folder("volume-A", 5, path).unwrap(), 20);
+        assert_eq!(store.folder_breakdown("volume-A", first, second, path).unwrap().allocated_delta, 10);
+        assert_eq!(store.changes_count("volume-A", first, second, Some(path)).unwrap(), 1);
+        assert_eq!(store.changes_between_path("volume-A", first, second, path, 50, 0).unwrap().len(), 1);
+        assert_eq!(store.extensions_between_path("volume-A", first, second, path).unwrap().items,
+            vec![(".txt".into(), 10, 1)]);
+    }
+    assert_eq!(store.resolve_folder("volume-A", 5, "c:\\\\CACHE\\\\子目录\\\\").unwrap(), 21);
+    assert_eq!(store.find_folder("volume-A", 5, "C:\\missing").unwrap(), None);
+
+    // Exercise the per-file fallback used by older scan intervals as well.
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute("UPDATE scans SET extensions_complete=0 WHERE id=?", [second]).unwrap();
+    db.execute("DELETE FROM extension_changes WHERE scan=?", [second]).unwrap();
+    for path in ["C:\\", "c:\\\\"] {
+        let types = store.extensions_between_path("volume-A", first, second, path).unwrap();
+        assert_eq!(types.items.len(), 3);
+        assert_eq!(types.items.iter().map(|(_, delta, _)| *delta).sum::<i128>(), 35);
+    }
+    assert_eq!(store.extensions_between_path("volume-A", first, second, "C:\\\\Cache\\\\").unwrap().items,
+        vec![(".txt".into(), 10, 1)]);
+}
+
+#[test]
+fn folder_queries_reject_malformed_absolute_drive_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("history.db")).unwrap();
+    for path in ["", "C", "C:", "C:cache", "cache", "cache\\child", "\\cache",
+        "1:\\", "é:\\", "C:/cache", "C:\\cache/child", "C:\\cache\0child",
+        "\\\\server\\share", "\\\\?\\C:\\cache"] {
+        assert!(store.find_folder("volume-A", 5, path).is_err(), "find_folder: {path:?}");
+        assert!(store.resolve_folder("volume-A", 5, path).is_err(), "resolve_folder: {path:?}");
+        assert!(store.folder_breakdown("volume-A", 0, 1, path).is_err(), "folder_breakdown: {path:?}");
+        assert!(store.extensions_between_path("volume-A", 0, 1, path).is_err(), "extensions: {path:?}");
+        assert!(store.changes_count("volume-A", 0, 1, Some(path)).is_err(), "changes_count: {path:?}");
+        assert!(store.changes_between_path("volume-A", 0, 1, path, 50, 0).is_err(), "changes: {path:?}");
+    }
+}

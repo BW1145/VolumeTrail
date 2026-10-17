@@ -708,7 +708,8 @@ impl Store {
 
     pub fn changes_count(&self, volume: &str, from: i64, to: i64, path: Option<&str>) -> Result<u64> {
         let count: i64 = if let Some(path) = path {
-            let prefix = format!("{}\\", path.trim_end_matches('\\'));
+            let path = normalize_folder_path(path)?;
+            let prefix = folder_prefix(&path);
             self.db.query_row("SELECT COUNT(*) FROM changes c JOIN scans s ON s.id=c.scan
                 WHERE s.volume=? AND c.scan>? AND c.scan<=? AND
                 (substr(c.old_path,1,length(?))=? COLLATE NOCASE OR substr(c.new_path,1,length(?))=? COLLATE NOCASE)",
@@ -723,7 +724,8 @@ impl Store {
 
     pub fn changes_between_path(&self, volume: &str, from: i64, to: i64,
         path: &str, limit: u64, offset: u64) -> Result<Vec<Change>> {
-        let prefix = format!("{}\\", path.trim_end_matches('\\'));
+        let path = normalize_folder_path(path)?;
+        let prefix = folder_prefix(&path);
         let mut stmt = self.db.prepare(
             "SELECT c.old_path,c.new_path,c.logical_delta,c.allocated_delta,c.kind
              FROM changes c JOIN scans s ON s.id=c.scan
@@ -739,8 +741,8 @@ impl Store {
 
     pub fn extensions_between_path(&self, volume: &str, from: i64, to: i64,
         path: &str) -> Result<ExtensionBreakdown> {
-        let path = if path.len() == 3 { path } else { path.trim_end_matches('\\') };
-        let prefix = format!("{}\\", path.trim_end_matches('\\'));
+        let path = normalize_folder_path(path)?;
+        let prefix = folder_prefix(&path);
         let version: i64 = self.db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let intervals: u64 = self.db.query_row("SELECT COUNT(*) FROM scans WHERE volume=? AND id>? AND id<=?",
             params![volume,from,to], |r| r.get(0))?;
@@ -803,8 +805,8 @@ impl Store {
     }
 
     pub fn folder_breakdown(&self, volume: &str, from: i64, to: i64, path: &str) -> Result<FolderBreakdown> {
-        let path = if path.len() == 3 { path } else { path.trim_end_matches('\\') };
-        let prefix = format!("{}\\", path.trim_end_matches('\\'));
+        let path = normalize_folder_path(path)?;
+        let prefix = folder_prefix(&path);
         let depth = path[3..].split('\\').filter(|part| !part.is_empty()).count() + 1;
         let mut stmt = self.db.prepare("SELECT f.path,f.allocated_delta,f.moved_delta,f.events
             FROM folder_changes f JOIN scans s ON s.id=f.scan
@@ -820,7 +822,7 @@ impl Store {
             let moved = i128::from(row.get::<_, i64>(2)?);
             result.allocated_delta += delta;
             result.moved_delta += moved;
-            if folder.eq_ignore_ascii_case(path) {
+            if folder.eq_ignore_ascii_case(&path) {
                 result.direct_delta += delta;
             } else if let Some(child) = folder_bucket_dir(&folder, depth) {
                 growth_entry(&mut children, child, delta, moved, row.get::<_, i64>(3)? as u64);
@@ -943,8 +945,9 @@ impl Store {
     }
 
     pub fn find_folder(&self, volume: &str, root_id: u64, path: &str) -> Result<Option<u64>> {
+        let path = normalize_folder_path(path)?;
         let mut parent = root_id;
-        for name in path.trim_end_matches('\\').split('\\').skip(1).filter(|part| !part.is_empty()) {
+        for name in path[3..].split('\\').filter(|part| !part.is_empty()) {
             let id = self.db.query_row("SELECT id FROM nodes WHERE volume=? AND parent=? AND name=? COLLATE NOCASE AND is_dir=1",
                 params![volume, parent as i64, name], |r| r.get::<_, i64>(0)).optional()?;
             let Some(id) = id else { return Ok(None); };
@@ -1080,6 +1083,20 @@ impl Store {
         }
         Ok(usage)
     }
+}
+
+fn normalize_folder_path(path: &str) -> Result<String> {
+    let bytes = path.as_bytes();
+    ensure!(bytes.len() >= 3 && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':' && bytes[2] == b'\\',
+        "Expected an absolute drive path such as C:\\ or C:\\folder");
+    ensure!(!path.contains('/') && !path.contains('\0'), "Invalid drive path");
+    let parts: Vec<_> = path[3..].split('\\').filter(|part| !part.is_empty()).collect();
+    Ok(format!("{}{}", &path[..3], parts.join("\\")))
+}
+
+fn folder_prefix(path: &str) -> String {
+    if path.len() == 3 { path.to_owned() } else { format!("{path}\\") }
 }
 
 fn folder_parent(path: &str) -> Option<String> {
