@@ -1,0 +1,32 @@
+name: Publish verified portable release
+
+on:
+  push:
+    branches: ['release/v0.2.2']
+    paths:
+      - '.github/workflows/publish-release.yml'
+      - 'scripts/publish_release.py'
+      - 'release/0.2.2.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-v0.2.2
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Package, publish and verify existing Windows artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/publish_release.py --publish
