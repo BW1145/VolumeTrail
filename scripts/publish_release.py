@@ -109,7 +109,11 @@ def publish(output):
         check(resolve_tag(ref) == SOURCE, "Existing version tag points elsewhere")
     releases = api("releases?per_page=100")
     existing = next((r for r in releases if r["tag_name"] == TAG), None)
-    check(existing is None, "Release already exists; inspect it before retrying")
+    check(existing is None or (existing["draft"] and not existing["prerelease"]),
+          "A published release already exists; inspect it before retrying")
+    if existing:
+        check(existing["body"].strip() == (ROOT / f"release/{VERSION}.md").read_text().strip(),
+              "Existing draft has different release notes")
     with tempfile.TemporaryDirectory() as temp:
         archive = Path(temp) / "original.zip"
         with archive.open("wb") as stream:
@@ -119,11 +123,18 @@ def publish(output):
         target, checksum = package(archive, output)
     if ref is None:
         api("git/refs", "-X", "POST", "-f", f"ref=refs/tags/{TAG}", "-f", f"sha={SOURCE}")
-    gh("release", "create", TAG, "--repo", REPO, "--verify-tag", "--draft",
-       "--title", f"盘迹 · VolumeTrail {VERSION}（Windows x64 便携版）",
-       "--notes-file", ROOT / f"release/{VERSION}.md")
-    gh("release", "upload", TAG, target, checksum, "--repo", REPO)
-    release = api("releases/tags/" + TAG)
+    if existing is None:
+        gh("release", "create", TAG, "--repo", REPO, "--verify-tag", "--draft",
+           "--title", f"盘迹 · VolumeTrail {VERSION}（Windows x64 便携版）",
+           "--notes-file", ROOT / f"release/{VERSION}.md")
+        existing = next(r for r in api("releases?per_page=100") if r["tag_name"] == TAG)
+    release_id = existing["id"]
+    uploaded = {a["name"] for a in existing["assets"]}
+    for local in (target, checksum):
+        if local.name not in uploaded:
+            gh("release", "upload", TAG, local, "--repo", REPO)
+    # Draft releases are addressed by ID; the public tag endpoint returns 404.
+    release = api(f"releases/{release_id}")
     check(release["draft"] and not release["prerelease"], "Release is not a stable draft")
     check({a["name"] for a in release["assets"]} == {target.name, checksum.name}, "Release assets mismatch")
     # Verify bytes served by GitHub before making the release public.
