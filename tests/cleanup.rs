@@ -179,6 +179,25 @@ fn interrupted_pending_after_200_terminal_rows_is_counted_and_visible() {
 }
 
 #[test]
+fn first_pending_intent_in_v9_migration_protects_the_next_growth_baseline() {
+    use volumetrail::model::*;
+    let (temp,mut store,safety,rule)=fixture();let root=&rule.directory[..3];let path=temp.path().join("data/history.db");
+    let sample=Path::new(&rule.directory).join("first.dmp");fs::write(&sample,b"dedicated first-pending fixture").unwrap();
+    let mut scan=ScanOutcome {checkpoint:Checkpoint {volume_id:rule.volume_id.clone(),journal_id:1,next_usn:10,root_id:5},mode:ScanMode::Full,total:100000,free:50000,
+        sampled_at:"2026-10-21T10:00:00+00:00".into(),pending:vec![],warnings:vec![]};
+    store.publish(root,&[Mutation::Upsert(Entry {id:30,parent:5,name:"first.dmp".into(),is_dir:false,logical:4096,allocated:4096,modified:0,attributes:0,links:vec![]})],&scan).unwrap();
+    let plan=preview(&store,&safety,&[rule.id],&||false).unwrap();let mut run=execute_plan(&store,&safety,&plan,"first-pending-v9",Some(1),None,&||true).unwrap();
+    run.state="running".into();run.deleted=0;run.unknown=0;run.verification="not_needed".into(); // stale summary must not override durable intent
+    store.record_cleanup_item(&run,0,&RunItem {path:sample.to_str().unwrap().into(),state:"pending".into(),reason:None,allocated_bytes:4096}).unwrap();
+    windows::delete_verified(sample.to_str().unwrap(),&plan.candidates[0].snapshot).unwrap();drop(store);
+    let db=rusqlite::Connection::open(&path).unwrap();db.execute_batch("ALTER TABLE scans DROP COLUMN comparison_from;DROP TABLE scan_baselines;PRAGMA user_version=9;").unwrap();drop(db);
+    let mut store=Store::open(&path).unwrap();assert!(store.cleanup_baseline_pending(&run.volume_id).unwrap());
+    store.recover_cleanup_runs().unwrap();assert_eq!(store.cleanup_run(&run.run_id).unwrap().unknown,1);assert!(store.cleanup_baseline_pending(&run.volume_id).unwrap());
+    scan.mode=ScanMode::Incremental;scan.checkpoint.next_usn=20;scan.sampled_at="2026-10-21T11:00:00+00:00".into();
+    store.publish(root,&[Mutation::Delete(30)],&scan).unwrap();assert!(store.default_interval(&store.reports().unwrap()).unwrap().is_none());
+}
+
+#[test]
 fn cleanup_run_count_and_365_day_retention_boundaries_are_exact() {
     let (_temp,store,safety,rule)=fixture();let plan=preview(&store,&safety,&[rule.id],&||false).unwrap();
     let template=execute_plan(&store,&safety,&plan,"template",None,None,&||false).unwrap();let now=chrono::Utc::now().timestamp();

@@ -128,6 +128,7 @@ impl Store {
             tx.execute("UPDATE cleanup_items SET state='unknown',reason='Process interrupted; do not replay' WHERE run=? AND state='pending'",[&run.run_id])?;
             run.state="interrupted".into();run.finished_at=Some(chrono::Utc::now().timestamp());
             if run.deleted>0 || run.unknown>0 {run.verification="pending".into();}
+            if run.deleted>0 || run.unknown>0 {self.mark_cleanup_baseline_pending(&run.volume_id,true)?;}
             self.update_cleanup_run(&run)?;
             tx.commit()?;
         }Ok(())

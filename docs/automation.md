@@ -18,6 +18,7 @@ query 只读现有历史，不自动扫描、提权或清理。没有历史时�
 overview 与 GUI 共用服务；`current_index` 是最近成功索引的容量与观测时间，`latest` 是
 仍保留的最近历史点，两者可能因用户删历史而不同。`interval` 是增长基线，缺失时为 null。
 默认增长比较为“上次操作最终成功点 → 本次清理前点”，不会取几秒内的核验差值。
+默认基线保存实际上一成功 ID；该点被删除或上次清理尚未核验时，默认比较不可用，不改用更早点。旧库仅回填可证明连续的区间。
 显式 from/to 指物理扫描 ID；覆盖元组顺序为总区间、完整目录汇总、可用汇总、逐项明细区间。
 覆盖不足的数据不能当作完整变化。summary/growth/folder/largest 返回 total/has_more；
 folder 的 comparison.children 也应用 offset，扩展名排行带 total/truncated。
@@ -70,7 +71,7 @@ VolumeTrail-cli.exe cleanup runs --drive C --limit 20 --offset 0 --json
 VolumeTrail-cli.exe cleanup cancel --id RUN_ID --json
 ```
 
-同一 request_id 重试返回原 run_id。不同计划不能复用请求 ID。取消只停止后续文件。
+同一 request_id 重试返回原 run_id。取消绑定当前 run 身份与独立信号，旧 pending run 不会取消同盘新任务。不同计划不能复用请求 ID。取消只停止后续文件。
 `state` 区分 completed/partial/cancelled/interrupted/running；`verification` 独立区分
 verified/not_needed/pending/unverified/cancelled/verified_by_later_scan。
 删除成功但核验未完成时，索引待下次扫描更新；不会回退到全量核验。
@@ -79,7 +80,7 @@ verified/not_needed/pending/unverified/cancelled/verified_by_later_scan。
 
 pending 行在删除前持久化。异常退出不重放，标记 unknown 并等待扫描核验。
 只读 status 在无操作锁时可推断 interrupted；实际恢复由持锁的下次操作写回。
-逐项结果最多 200 条，30 天后裁剪并标记；汇总/request 幂等保留最多 1000 次且最多 365 天。
+逐项结果最多显示 200 条，优先显示 pending/unknown；item_total/items_has_more 明确截断，pending/unknown 汇总由独立 SQL 计数。终态明细保留最多 200 条，当前未决意图额外保护。30 天后裁剪并标记；汇总/request 幂等保留最多 1000 次且最多 365 天。
 计划最多保留 32 份。超出保留期的请求没有幂等保证，不能盲目重试旧删除请求。
 
 退出码：0 成功/查询成功；1 失败；2 部分完成或核验未完成；3 取消；4 修订/计划冲突或中断。

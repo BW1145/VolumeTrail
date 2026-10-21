@@ -49,8 +49,9 @@ impl Store {
             db.execute_batch("BEGIN IMMEDIATE;
                 ALTER TABLE scan_baselines ADD COLUMN cleanup_pending INTEGER NOT NULL DEFAULT 0;
                 UPDATE scan_baselines SET cleanup_pending=1 WHERE EXISTS(SELECT 1 FROM cleanup_runs r
-                    WHERE r.volume=scan_baselines.volume AND json_extract(r.payload,'$.verification') IN ('pending','unverified','cancelled')
-                    AND (json_extract(r.payload,'$.deleted')>0 OR json_extract(r.payload,'$.unknown')>0));
+                    WHERE r.volume=scan_baselines.volume AND COALESCE(json_extract(r.payload,'$.verification'),'pending') NOT IN ('verified','verified_by_later_scan')
+                    AND (json_extract(r.payload,'$.deleted')>0 OR json_extract(r.payload,'$.unknown')>0
+                        OR EXISTS(SELECT 1 FROM cleanup_items i WHERE i.run=r.id AND i.state IN ('pending','unknown'))));
                 PRAGMA user_version=11;COMMIT;")?;
         }Ok(())
     }

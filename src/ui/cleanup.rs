@@ -175,6 +175,7 @@ impl VolumeTrailApp {
             for run in &state.runs {
                 if ui.add_enabled(!busy,egui::Button::new(format!("{} · {} · 删除 {} · 跳过 {} · 失败 {}",run_time(run.started_at),run_state(&run.state),run.deleted,run.skipped,run.failed))).clicked() {job=Some(Job::Result(run.run_id.clone()));}
                 ui.label(RichText::new(verification_state(&run.verification)).color(if run.verification=="verified" || run.verification=="not_needed" {MUTED} else {AMBER}));
+                if run.unknown>0 {ui.colored_label(AMBER,format!("{} 项处理结果尚未确定",run.unknown));}
             }
         }
         if let Some((run,items))=&state.result {
@@ -217,13 +218,19 @@ fn skip_reason(reason:&str)->&str {
     else {"无法安全处理，已跳过；原始原因见技术详情"}
 }
 fn friendly_error(error:&str)->&str {
-    if error.contains("Rule") && (error.contains("changed") || error.contains("revision")) {"规则已更新，请刷新后重试。"}
+    if error.contains("Rule name") {"请填写 1 至 100 字的规则名称。"}
+    else if error.contains("Provide 1-32") {"请填写文件名匹配，例如 *.dmp。"}
+    else if error.contains("filename wildcards") {"文件名匹配支持 * 和 ?；多个模式用分号分隔，请勿填写路径。"}
+    else if error.contains("Rule does not exist") {"规则已被删除，请刷新列表。"}
+    else if error.contains("Rule") && (error.contains("changed") || error.contains("revision")) {"规则已更新，请刷新后重试。"}
     else if error.contains("expired") || error.contains("invalidated") {"预览已过期或设置已变化，请重新预览。"}
     else if error.contains("Protected directory") || error.contains("Volume roots are protected") {"所选目录属于受保护范围，请选择具体的可清理文件夹。"}
     else if error.contains("Volume identity mismatch") {"磁盘身份已变化，请确认目标目录后重新保存规则。"}
     else if error.contains("Another") && error.contains("scan") {"扫描或清理正在进行，请稍后重试。"}
     else if error.contains("absolute local") || error.contains("Ambiguous") {"请选择完整的本地磁盘目录。"}
     else if error.contains("0x80070005") {"无法访问所选目录，请选择有权限读取的文件夹。"}
+    else if error.contains("0x80070003") || error.contains("0x80070002") {"目标目录已移动或不存在，请重新选择。"}
+    else if error.contains("Preview was truncated") {"预览未覆盖完整范围，请缩小目录或匹配条件后重新预览。"}
     else {"操作未完成，请检查目录和规则设置；原始原因见错误详情。"}
 }
 
