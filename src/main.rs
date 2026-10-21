@@ -7,6 +7,9 @@ use std::env;
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let action = args.next().unwrap_or_else(|| "ui".into());
+    if ["help","--help","-h"].contains(&action.as_str()) {volumetrail::capabilities::help();return Ok(());}
+    if action == "capabilities" {println!("{}",serde_json::to_string(&volumetrail::capabilities::value())?);return Ok(());}
+    if action == "cleanup" {return volumetrail::cleanup::cli::run(args.collect());}
     if action == "query" { return volumetrail::query::run(args.collect()); }
     if action == "ui" {
         let data = worker::data_dir()?;

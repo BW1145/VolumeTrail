@@ -1,3 +1,9 @@
+mod folder_picker;
+mod history;
+#[cfg(feature="ui-capture")]
+pub mod capture;
+mod cleanup;
+mod overview;
 use crate::{config::AppConfig, startup::{self, StartupStatus}, store::{Change, ExtensionBreakdown, FolderBreakdown, FolderGrowth, FolderItem, RankedItem, Report, StorageUsage, Store}, worker};
 use anyhow::Result;
 use chrono::{DateTime, Local};
@@ -13,7 +19,7 @@ const CANVAS: Color32 = Color32::from_rgb(246, 248, 247);
 const RULE: Color32 = Color32::from_rgb(219, 227, 224);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum View { Overview, Changes, Folders, History, Settings }
+enum View { Overview, Changes, Folders, History, Settings, Cleanup }
 
 struct PendingClose {
     drive: char,
@@ -23,6 +29,8 @@ struct PendingClose {
 }
 
 pub struct VolumeTrailApp {
+    cleanup_state: cleanup::CleanupState,
+    overview_state: overview::OverviewState,
     data: PathBuf,
     store: Store,
     config: AppConfig,
@@ -38,6 +46,7 @@ pub struct VolumeTrailApp {
     changes: Vec<Change>,
     growth: Vec<FolderGrowth>,
     compare_from: Option<i64>,
+    compare_explicit: bool,
     comparison_key: Option<(i64, i64, u8, u64)>,
     comparison_rx: Option<Receiver<((i64, i64, u8, u64), Result<(Vec<FolderGrowth>, Vec<Change>, (u64, u64, u64, u64), ExtensionBreakdown, u64, Option<FolderBreakdown>), String>)>>,
     comparison_coverage: Option<(u64, u64, u64, u64)>,
@@ -95,10 +104,12 @@ impl VolumeTrailApp {
         let store = Store::open(&worker::store_path(&data))?;
         let config = AppConfig::load(&data)?;
         let mut app = Self {
+            cleanup_state: cleanup::CleanupState::default(),
+            overview_state: overview::OverviewState::default(),
             data, store, saved_config: config.clone(), config, drive: 'C', view: View::Overview,
             reports: Vec::new(), scan_count: 0, selected: None,
             history_selection: HashSet::new(), history_message: None, history_rx: None,
-            changes: Vec::new(), growth: Vec::new(), compare_from: None,
+            changes: Vec::new(), growth: Vec::new(), compare_from: None, compare_explicit:false,
             comparison_key: None, comparison_rx: None, comparison_coverage: None,
             comparison_path: None, comparison_breakdown: None, extensions: ExtensionBreakdown::default(), details_page: 0, details_total: 0,
             folder_depth: 5,
@@ -278,9 +289,6 @@ impl VolumeTrailApp {
         }
     }
 
-    fn selected_report(&self) -> Option<&Report> {
-        self.reports.iter().find(|report| Some(report.id) == self.selected)
-    }
 
     fn folder_path(&self) -> String {
         let mut path = self.breadcrumbs.first().map(|(_, name)| name.clone()).unwrap_or_default();
@@ -318,7 +326,7 @@ impl VolumeTrailApp {
                     for letter in 'A'..='Z' {
                         if PathBuf::from(format!("{letter}:\\")).exists()
                             && ui.selectable_value(&mut self.drive, letter, format!("{letter} 盘")).clicked()
-                        { self.selected = None; self.history_selection.clear(); self.breadcrumbs.clear(); self.refresh(); }
+                        { self.selected = None; self.compare_explicit=false;self.compare_from=None; self.history_selection.clear(); self.breadcrumbs.clear(); self.refresh(); }
                     }
                 });
             ui.separator();
@@ -389,260 +397,42 @@ impl VolumeTrailApp {
         ui.separator();
     }
 
-    fn overview(&mut self, ui: &mut egui::Ui) {
-        let Some(report) = self.selected_report().cloned() else {
-            ui.heading("还没有扫描记录");
-            ui.label("选择磁盘并开始扫描，完成后会在这里显示空间变化。");
-            return;
-        };
-        ui.label(RichText::new("磁盘概览").size(25.0).strong());
-        ui.label(RichText::new(format!("所选记录  {}  ·  {}", scan_time(&report.finished), scan_mode_label(&report.mode))).color(MUTED));
-        ui.add_space(14.0);
-        let metrics = [
-            ("已用空间", report.total.saturating_sub(report.free), INK),
-            ("可用空间", report.free, GREEN),
-            ("文件占用", report.allocated, INK),
-            ("未归入文件统计", report.total.saturating_sub(report.free).saturating_sub(report.allocated), AMBER),
-        ];
-        let columns = if ui.available_width() >= 760.0 { 4 } else { 2 };
-        for row in metrics.chunks(columns) {
-            ui.columns(columns, |areas| {
-                for (area, (title, value, color)) in areas.iter_mut().zip(row) {
-                    metric(area, title, *value, *color);
-                }
-            });
-            if columns == 2 { ui.add_space(8.0); }
-        }
-        ui.add_space(14.0);
-        let fraction = if report.total == 0 { 0.0 } else { 1.0 - report.free as f32 / report.total as f32 };
-        ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).fill(INK).desired_height(8.0));
-        ui.add_space(19.0);
-        ui.separator();
-        ui.add_space(12.0);
-        ui.label(RichText::new("已用空间趋势").size(18.0).strong());
-        ui.horizontal(|ui| {
-            for (days, label) in [(7, "一周"), (30, "一月"), (365, "一年"), (0, "全部")] {
-                if ui.selectable_value(&mut self.config.trend_days, days, label).changed() {
-                    let mut saved = self.saved_config.clone();
-                    saved.trend_days = self.config.trend_days;
-                    if let Err(error) = saved.save(&self.data) {
-                        self.error = Some(format!("保存趋势范围失败：{error:#}"));
-                    } else { self.saved_config = saved; }
-                }
-            }
-        });
-        self.space_chart(ui);
-        ui.add_space(16.0);
-        ui.separator();
-        ui.add_space(12.0);
-        ui.label(RichText::new("扫描概况").size(18.0).strong());
-        let latest = self.reports.iter().find(|item| item.root == report.root);
-        let previous = self.reports.iter().find(|item| item.root == report.root && item.id < report.id);
-        let (change, change_color) = match previous {
-            Some(previous) => {
-                let used = report.total.saturating_sub(report.free) as i128;
-                let prior_used = previous.total.saturating_sub(previous.free) as i128;
-                let delta = used - prior_used;
-                let value = if delta > 0 { format!("+{}", bytes(delta as u64)) }
-                    else if delta < 0 { format!("-{}", bytes((-delta) as u64)) }
-                    else { "0 B".into() };
-                (value, if delta > 0 { RED } else if delta < 0 { GREEN } else { MUTED })
-            }
-            None => ("暂无对比".into(), MUTED),
-        };
-        let detailed = self.reports.iter().filter(|item| item.root == report.root && item.details).count();
-        let summary = [
-            ("已保留扫描", format!("{} 次", self.scan_count), INK),
-            ("有文件明细", format!("{} 次", detailed), INK),
-            ("距最近完成", latest.map(|item| scan_age(&item.finished)).unwrap_or_else(|| "暂无记录".into()), INK),
-            ("所选记录已用变化", change, change_color),
-        ];
-        let columns = if ui.available_width() >= 760.0 { 3 } else { 2 };
-        for row in summary.chunks(columns) {
-            ui.columns(columns, |areas| {
-                for (area, (title, value, color)) in areas.iter_mut().zip(row) {
-                    area.label(RichText::new(*title).color(MUTED));
-                    area.label(RichText::new(value).size(22.0).color(*color));
-                }
-            });
-            if columns == 2 { ui.add_space(8.0); }
-        }
-        for warning in &report.warnings { ui.colored_label(AMBER, warning); }
-        if let Some(performance) = &report.performance {
-            ui.add_space(12.0);
-            ui.collapsing("扫描性能", |ui| {
-                ui.label(format!("总用时 {:.1} 秒 · 等待系统空闲 {:.1} 秒",
-                    performance.duration_ms as f64 / 1000.0, performance.paused_ms as f64 / 1000.0));
-                ui.label(format!("读取 {:.1} 秒 · 提交 {:.1} 秒 · 整理 {:.1} 秒",
-                    performance.read_ms.unwrap_or(0) as f64 / 1000.0,
-                    performance.commit_ms.unwrap_or(0) as f64 / 1000.0,
-                    performance.maintenance_ms.unwrap_or(0) as f64 / 1000.0));
-                ui.label(format!("变化事件 {} 条 · 涉及文件 {} 个 · 实际读取 {} 次",
-                    performance.counters.journal_records, performance.counters.unique_changed_files, performance.counters.entry_reads));
-                if let Some(phases) = &performance.commit_phases {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(format!("提交明细：准备 {:.1} 秒 · 文件 {:.1} 秒 · 目录 {:.1} 秒 · 历史 {:.1} 秒",
-                            phases.prepare_ms as f64 / 1000.0, phases.entries_ms as f64 / 1000.0,
-                            phases.folders_ms as f64 / 1000.0, phases.history_ms as f64 / 1000.0));
-                    });
-                }
-                if let Some(cpu) = performance.average_cpu_percent {
-                    ui.label(format!("平均 CPU 占用 {:.2}%（整机口径） · CPU 用时 {:.2} 秒",
-                        cpu, performance.cpu_time_ms.unwrap_or(0) as f64 / 1000.0));
-                }
-                if let Some(peak) = performance.process_peak_working_set_bytes {
-                    ui.label(format!("扫描进程峰值内存 {}", bytes(peak)));
-                }
-            });
-        }
-    }
-
-    fn space_chart(&mut self, ui: &mut egui::Ui) {
-        let mut reports: Vec<&Report> = self.reports.iter()
-            .filter(|item| item.root.starts_with(self.drive))
-            .filter(|item| self.config.trend_days == 0 || DateTime::parse_from_rfc3339(&item.sampled)
-                .is_ok_and(|at| Local::now().signed_duration_since(at).num_days() < i64::from(self.config.trend_days)))
-            .collect();
-        reports.reverse();
-        if reports.len() < 2 {
-            ui.label(RichText::new("再完成一次扫描，就能看到空间变化趋势。").color(MUTED));
-            return;
-        }
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{} 个时间点", reports.len())).color(MUTED));
-            ui.colored_label(RED, "●");
-            ui.label(RichText::new("增加").color(MUTED));
-            ui.colored_label(GREEN, "●");
-            ui.label(RichText::new("释放").color(MUTED));
-        });
-        if reports.len() > 600 {
-            let mut selected = vec![reports[0]];
-            let window = reports.len().div_ceil(300);
-            for chunk in reports[1..reports.len()-1].chunks(window) {
-                let min = chunk.iter().min_by_key(|item| item.total.saturating_sub(item.free)).unwrap();
-                let max = chunk.iter().max_by_key(|item| item.total.saturating_sub(item.free)).unwrap();
-                if min.id < max.id { selected.extend([*min, *max]); }
-                else if min.id > max.id { selected.extend([*max, *min]); }
-                else { selected.push(*min); }
-            }
-            selected.push(reports[reports.len()-1]);
-            selected.sort_by_key(|item| item.id);
-            selected.dedup_by_key(|item| item.id);
-            reports = selected;
-        }
-        let width = ui.available_width();
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 208.0), egui::Sense::click());
-        let plot = egui::Rect::from_min_max(rect.min + egui::vec2(66.0, 12.0), rect.max - egui::vec2(12.0, 30.0));
-        let used = |report: &Report| report.total.saturating_sub(report.free);
-        let min_used = reports.iter().map(|item| used(item)).min().unwrap_or(0) as f64;
-        let max_used = reports.iter().map(|item| used(item)).max().unwrap_or(0) as f64;
-        let padding = if max_used == min_used { 1024.0 * 1024.0 * 1024.0 }
-            else { ((max_used - min_used) * 0.15).max(16.0 * 1024.0 * 1024.0) };
-        let low = (min_used - padding).max(0.0);
-        let high = max_used + padding;
-        let range = high - low;
-        let painter = ui.painter_at(rect);
-        for step in 0..=2 {
-            let t = step as f32 / 2.0;
-            let y = egui::lerp(plot.bottom()..=plot.top(), t);
-            painter.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], Stroke::new(1.0_f32, RULE));
-            painter.text(egui::pos2(plot.left() - 8.0, y), egui::Align2::RIGHT_CENTER,
-                chart_bytes((low + range * t as f64) as u64), egui::FontId::proportional(11.0), MUTED);
-        }
-        let timestamps: Vec<i64> = reports.iter().map(|item| DateTime::parse_from_rfc3339(&item.sampled)
-            .map_or(0, |at| at.timestamp())).collect();
-        let start = timestamps[0];
-        let span = timestamps[timestamps.len()-1].saturating_sub(start).max(1);
-        let positions: Vec<egui::Pos2> = reports.iter().enumerate().map(|(index, item)| {
-            let x = egui::lerp(plot.left()..=plot.right(), (timestamps[index]-start) as f32 / span as f32);
-            let y = egui::lerp(plot.bottom()..=plot.top(), ((used(item) as f64 - low) / range) as f32);
-            egui::pos2(x, y)
-        }).collect();
-        for index in 1..positions.len() {
-            let color = if used(reports[index]) > used(reports[index - 1]) { RED }
-                else if used(reports[index]) < used(reports[index - 1]) { GREEN }
-                else { MUTED };
-            painter.line_segment([positions[index - 1], positions[index]], Stroke::new(2.5_f32, color));
-        }
-        let clicked = response.clicked();
-        let nearest = response.hover_pos().or_else(|| response.interact_pointer_pos()).map(|pointer| {
-            positions.iter().enumerate().min_by(|(_, a), (_, b)|
-                (a.x - pointer.x).abs().total_cmp(&(b.x - pointer.x).abs())).unwrap().0
-        });
-        for (index, point) in positions.iter().enumerate() {
-            if Some(reports[index].id) == self.selected || Some(index) == nearest {
-                painter.circle_filled(*point, 5.0, INK);
-                painter.circle_filled(*point, 2.5, Color32::WHITE);
-            }
-        }
-        painter.text(egui::pos2(plot.left(), rect.bottom() - 5.0), egui::Align2::LEFT_BOTTOM,
-            scan_time(&reports[0].sampled), egui::FontId::proportional(11.0), MUTED);
-        painter.text(egui::pos2(plot.right(), rect.bottom() - 5.0), egui::Align2::RIGHT_BOTTOM,
-            scan_time(&reports[reports.len() - 1].sampled), egui::FontId::proportional(11.0), MUTED);
-        if let Some(index) = nearest {
-            let item = reports[index];
-            let tooltip = format!("{}\n已用 {}\n文件明细：{}", scan_time(&item.sampled), chart_bytes(used(item)),
-                if item.details { "有" } else { "已清理" });
-            response.on_hover_text(tooltip);
-            if clicked {
-                self.selected = Some(item.id);
-                self.load_selected();
-            }
-        }
-    }
-
     fn changes_view(&mut self, ui: &mut egui::Ui) {
         ui.heading("空间变化");
         let reports: Vec<Report> = self.reports.iter()
             .filter(|report| report.root.starts_with(self.drive)).cloned().collect();
-        let Some(initial_end) = reports.iter().find(|report| Some(report.id) == self.selected).or_else(|| reports.first()) else {
-            ui.label("至少完成两次扫描后，才能比较文件夹增长。");
-            return;
+        let Some(initial)=reports.iter().find(|r|Some(r.id)==self.selected).or_else(||reports.first()) else {
+            ui.label("尚无扫描记录，完成两次扫描后可比较目录变化。");return;
         };
-        let mut end_id = initial_end.id;
-        let mut from_id = self.compare_from.unwrap_or_else(|| reports.iter()
-            .find(|report| report.id < end_id && report.volume == initial_end.volume)
-            .map_or(0, |report| report.id));
-        let starts: Vec<_> = reports.iter().filter(|report| report.id < end_id && report.volume == initial_end.volume).collect();
-        if !starts.iter().any(|report| report.id == from_id) {
-            from_id = starts.first().map_or(0, |report| report.id);
+        let mut end_id=initial.id;
+        if !self.compare_explicit {
+            end_id=initial.operation_pre.unwrap_or(initial.id);
+            self.compare_from=reports.iter().find(|r|r.id==end_id).and_then(|r|r.comparison_from);
         }
+        let Some(initial_end)=reports.iter().find(|r|r.id==end_id) else {ui.label("此操作的原扫描点已整理，默认比较不可用。");return;};
+        let starts:Vec<_>=reports.iter().filter(|r|r.id<end_id && r.volume==initial_end.volume).collect();
+        let mut from_id=self.compare_from.filter(|id|starts.iter().any(|r|r.id==*id)).unwrap_or(0);
+        let old_from=from_id;let old_end=end_id;
         ui.horizontal(|ui| {
             ui.label("从");
-            egui::ComboBox::from_id_salt("compare_from")
-                .selected_text(starts.iter().find(|report| report.id == from_id)
-                    .map_or_else(|| "选择扫描记录".into(), |report| scan_time(&report.finished)))
-                .show_ui(ui, |ui| {
-                    for report in &starts {
-                        ui.selectable_value(&mut from_id, report.id, scan_time(&report.finished));
-                    }
-                });
+            egui::ComboBox::from_id_salt("compare_from").selected_text(starts.iter().find(|r|r.id==from_id)
+                .map_or_else(||"选择起点".into(),|r|scan_time(&r.sampled))).show_ui(ui,|ui| {
+                for report in &starts {ui.selectable_value(&mut from_id,report.id,scan_time(&report.sampled));}
+            });
             ui.label("到");
-            egui::ComboBox::from_id_salt("compare_to")
-                .selected_text(scan_time(&initial_end.finished))
-                .show_ui(ui, |ui| {
-                    for report in &reports {
-                        ui.selectable_value(&mut end_id, report.id, scan_time(&report.finished));
-                    }
-                });
+            egui::ComboBox::from_id_salt("compare_to").selected_text(scan_time(&initial_end.sampled)).show_ui(ui,|ui| {
+                for report in &reports {ui.selectable_value(&mut end_id,report.id,scan_time(&report.sampled));}
+            });
         });
-        if Some(end_id) != self.selected {
-            self.selected = Some(end_id);
-            self.compare_from = None;
-            self.load_selected();
-        } else {
-            self.compare_from = Some(from_id);
-        }
-        let end = reports.iter().find(|report| report.id == end_id).unwrap();
-        let valid_starts: Vec<_> = reports.iter().filter(|report| report.id < end_id && report.volume == end.volume).collect();
-        let from_id = self.compare_from.filter(|id| valid_starts.iter().any(|report| report.id == *id))
-            .or_else(|| valid_starts.first().map(|report| report.id));
-        let Some(from_id) = from_id else {
-            ui.label("这条记录之前没有可比较的扫描。");
-            return;
+        if old_from!=from_id || old_end!=end_id {self.compare_explicit=true;self.comparison_key=None;}
+        self.selected=Some(end_id);
+        let end=reports.iter().find(|r|r.id==end_id).unwrap();
+        self.compare_from=(from_id>0 && reports.iter().any(|r|r.id==from_id && r.id<end_id && r.volume==end.volume)).then_some(from_id);
+        let Some(from_id)=self.compare_from else {
+            ui.colored_label(AMBER,"默认比较所需的扫描点已整理或不足。可手动选择已保存的两个时间点。");return;
         };
-        self.compare_from = Some(from_id);
         if let Some(path) = self.comparison_path.clone() {
+            if ui.button("为此目录创建清理规则…").clicked() {self.new_cleanup_rule(path.clone());}
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&path).strong());
                 if ui.button("返回全部").clicked() {
@@ -788,7 +578,12 @@ impl VolumeTrailApp {
                         ui.label(RichText::new(bytes(item.allocated)).strong());
                         if self.largest_mode == Some(true) { ui.label(format!("{} 文件", item.files)); }
                         if ui.small_button("打开").clicked() { self.open_path(&item.path, self.largest_mode == Some(false)); }
-                        ui.add(egui::Label::new(&item.path).truncate()).on_hover_text(&item.path);
+                        ui.add(egui::Label::new(&item.path).truncate()).on_hover_text(&item.path).context_menu(|ui| {
+                            if ui.button("为所在目录创建清理规则…").clicked() {
+                                let scope=if self.largest_mode==Some(true) {item.path.clone()} else {Path::new(&item.path).parent().map(|p|p.to_string_lossy().into_owned()).unwrap_or_default()};
+                                self.new_cleanup_rule(scope);ui.close();
+                            }
+                        });
                     });
                     ui.separator();
                 }
@@ -804,16 +599,20 @@ impl VolumeTrailApp {
             }
         });
         ui.label(RichText::new(self.folder_path()).color(MUTED));
+        if ui.button("为此目录创建清理规则…").clicked() {self.new_cleanup_rule(self.folder_path());}
         ui.separator();
         let items = self.folders.clone();
         egui::ScrollArea::vertical().show_rows(ui, 30.0, items.len(), |ui, range| {
             for item in items[range].iter().cloned() {
                 ui.horizontal(|ui| {
                     let label = if item.is_dir { format!("> {}", item.name) } else { item.name.clone() };
-                    if ui.selectable_label(false, label).clicked() && item.is_dir {
-                        self.breadcrumbs.push((item.id, item.name.clone()));
-                        self.load_folder();
-                    }
+                    let response=ui.selectable_label(false,label);
+                    let selected=response.clicked();
+                    let scope=if item.is_dir {format!("{}{}",self.folder_path(),item.name)} else {self.folder_path()};
+                    response.context_menu(|ui| {
+                        if ui.button("为此目录创建清理规则…").clicked() {self.new_cleanup_rule(scope);ui.close();}
+                    });
+                    if selected && item.is_dir {self.breadcrumbs.push((item.id,item.name.clone()));self.load_folder();}
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let path = format!("{}{}", self.folder_path(), item.name);
                         if ui.small_button("定位").clicked() { self.open_path(&path, !item.is_dir); }
@@ -824,50 +623,6 @@ impl VolumeTrailApp {
             }
         });
         if self.folders.len() == 5000 { ui.label("当前只显示前 5000 项。"); }
-    }
-
-    fn history_view(&mut self, ui: &mut egui::Ui) {
-        ui.heading("扫描记录");
-        let reports: Vec<Report> = self.reports.iter().filter(|report| report.root.starts_with(self.drive)).cloned().collect();
-        ui.horizontal(|ui| {
-            let all_selected = !reports.is_empty() && reports.iter().all(|report| self.history_selection.contains(&report.id));
-            if ui.add_enabled(!reports.is_empty(), egui::Button::new(if all_selected { "取消全选" } else { "全选可见记录" })).clicked() {
-                if all_selected { self.history_selection.clear(); }
-                else { self.history_selection.extend(reports.iter().map(|report| report.id)); }
-            }
-            let can_edit = !self.history_selection.is_empty() && !self.any_running && self.history_rx.is_none();
-            if ui.add_enabled(can_edit, egui::Button::new(format!("清理明细 ({})", self.history_selection.len())))
-                .on_hover_text("保留扫描时间、空间用量和文件夹变化汇总").clicked() {
-                let ids: Vec<i64> = self.history_selection.iter().copied().collect();
-                self.start_history_job(worker::HistoryAction::ClearDetails(ids));
-            }
-            if ui.add_enabled(can_edit, egui::Button::new(format!("删除所选 ({})", self.history_selection.len()))).clicked() {
-                let ids: Vec<i64> = self.history_selection.iter().copied().collect();
-                self.start_history_job(worker::HistoryAction::Delete(ids));
-            }
-            if ui.add_enabled(!self.any_running && self.history_rx.is_none(), egui::Button::new("按容量整理")).clicked() {
-                self.start_history_job(worker::HistoryAction::Prune(self.saved_config.budget_bytes()));
-            }
-        });
-        if self.history_rx.is_some() { ui.label("正在整理历史…"); }
-        if let Some(message) = &self.history_message { ui.label(RichText::new(message).color(GREEN)); }
-        egui::ScrollArea::vertical().show_rows(ui, 30.0, reports.len(), |ui, range| {
-            for report in reports[range].iter().cloned() {
-                ui.horizontal(|ui| {
-                    let mut checked = self.history_selection.contains(&report.id);
-                    if ui.checkbox(&mut checked, "").changed() {
-                        if checked { self.history_selection.insert(report.id); }
-                        else { self.history_selection.remove(&report.id); }
-                    }
-                    if ui.selectable_label(Some(report.id) == self.selected,
-                        format!("{}  ·  {}  ·  {} 已用  ·  {}", scan_time(&report.finished), scan_mode_label(&report.mode),
-                            bytes(report.total.saturating_sub(report.free)), if report.details { "含明细" } else { "时间点" }))
-                        .clicked()
-                    { self.selected = Some(report.id); self.load_selected(); self.view = View::Overview; }
-                });
-            }
-        });
-        if self.reports.len() == 500 { ui.label("当前只显示最近 500 次扫描。"); }
     }
 
     fn start_history_job(&mut self, action: worker::HistoryAction) {
@@ -929,6 +684,9 @@ impl VolumeTrailApp {
     }
 
     fn settings_view(&mut self, ui: &mut egui::Ui) {
+        if ui.button("文件清理规则").clicked() {self.view=View::Cleanup;}
+        ui.label("管理指定目录的直接删除规则；与扫描历史整理分开。");
+        ui.separator();
         ui.heading("设置");
         ui.add_space(12.0);
         ui.strong("自动扫描磁盘");
@@ -1033,6 +791,7 @@ impl VolumeTrailApp {
 
 impl eframe::App for VolumeTrailApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_cleanup();
         self.poll_history_job();
         self.poll_comparison();
         self.poll_largest();
@@ -1089,6 +848,7 @@ impl eframe::App for VolumeTrailApp {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(CANVAS).inner_margin(egui::Margin::symmetric(24, 20))).show(ctx, |ui| {
             self.toolbar(ui);
             match self.view {
+                View::Cleanup => {egui::ScrollArea::vertical().show(ui,|ui|self.cleanup_view(ui));}
                 View::Overview => { egui::ScrollArea::vertical().show(ui, |ui| self.overview(ui)); }
                 View::Changes => self.changes_view(ui),
                 View::Folders => self.folders_view(ui),
@@ -1164,14 +924,6 @@ fn scan_time(value: &str) -> String {
         .unwrap_or_else(|_| value.to_owned())
 }
 
-fn scan_age(value: &str) -> String {
-    let Ok(time) = DateTime::parse_from_rfc3339(value) else { return "时间未知".into() };
-    let minutes = Local::now().signed_duration_since(time).num_minutes().max(0);
-    if minutes == 0 { "刚刚".into() }
-    else if minutes < 60 { format!("{minutes} 分钟前") }
-    else if minutes < 1440 { format!("{} 小时前", minutes / 60) }
-    else { format!("{} 天前", minutes / 1440) }
-}
 
 fn scan_mode_label(value: &str) -> &str {
     if value == "incremental" { "增量" } else { "全量" }

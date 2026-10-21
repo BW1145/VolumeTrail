@@ -31,7 +31,7 @@ impl AppConfig {
 
     pub fn save(&self, data: &Path) -> Result<()> {
         self.validate()?;
-        fs::write(data.join("config.json"), serde_json::to_vec_pretty(self)?)
+        crate::atomic::write(&data.join("config.json"), &serde_json::to_vec_pretty(self)?)
             .context("Save VolumeTrail configuration")?;
         Ok(())
     }
@@ -68,5 +68,16 @@ mod tests {
     fn older_config_defaults_to_keeping_the_window_open() {
         let config: AppConfig = serde_json::from_str(r#"{"drives":["C"],"history_budget_mib":512}"#).unwrap();
         assert!(!config.close_after_manual_scan);
+    }
+
+    #[test]
+    fn failed_atomic_replace_preserves_existing_configuration() {
+        use std::{fs::OpenOptions,os::windows::fs::OpenOptionsExt};
+        let dir=tempfile::tempdir().unwrap();let original=AppConfig::default();original.save(dir.path()).unwrap();
+        let held=OpenOptions::new().read(true).share_mode(1).open(dir.path().join("config.json")).unwrap();
+        let updated=AppConfig {drives:vec!['E'],..original.clone()};
+        assert!(updated.save(dir.path()).is_err());assert_eq!(AppConfig::load(dir.path()).unwrap(),original);
+        drop(held);updated.save(dir.path()).unwrap();assert_eq!(AppConfig::load(dir.path()).unwrap(),updated);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(),1);
     }
 }

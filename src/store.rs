@@ -3,11 +3,14 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use std::{collections::{HashMap, HashSet}, fs, path::{Path, PathBuf}, time::{Duration, Instant}};
+mod operations;
+mod cleanup;
 
 pub struct Store {
     db: Connection,
     path: PathBuf,
     staging: bool,
+    verification_context: Option<(Option<i64>,String)>,
     cancel_path: Option<PathBuf>,
     pub commit_timings: CommitTimings,
 }
@@ -21,7 +24,7 @@ pub struct Change {
     pub kind: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Report {
     pub id: i64,
     pub root: String,
@@ -38,6 +41,9 @@ pub struct Report {
     pub details: bool,
     pub aggregate: u8,
     pub performance: Option<ScanPerformance>,
+    pub operation_pre: Option<i64>,
+    pub verification: String,
+    pub comparison_from: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -59,7 +65,7 @@ pub struct RankedItem {
     pub modified: i64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct FolderGrowth {
     pub path: String,
     pub allocated_delta: i128,
@@ -103,7 +109,7 @@ impl Store {
         db.busy_timeout(Duration::from_secs(3))?;
         ensure!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? >= 2,
             "History database needs a one-time upgrade; open VolumeTrail first");
-        Ok(Self { db, path: path.to_path_buf(), staging: false, cancel_path: None, commit_timings: CommitTimings::default() })
+        Ok(Self { db, path: path.to_path_buf(), staging: false, verification_context: None, cancel_path: None, commit_timings: CommitTimings::default() })
     }
 
     pub fn data_version(&self) -> Result<i64> {
@@ -238,7 +244,11 @@ impl Store {
                 CREATE INDEX nodes_directories ON nodes(volume,id,parent,name) WHERE is_dir=1;
                 PRAGMA user_version=7; COMMIT;")?;
         }
-        Ok(Self { db, path: path.to_path_buf(), staging: false, cancel_path: None, commit_timings: CommitTimings::default() })
+        Self::migrate_operations(&db)?;
+        Self::migrate_cleanup(&db)?;
+        Self::migrate_baselines(&db)?;
+        Self::migrate_pending_baselines(&db)?;
+        Ok(Self { db, path: path.to_path_buf(), staging: false, verification_context: None, cancel_path: None, commit_timings: CommitTimings::default() })
     }
 
     pub fn set_cancel_path(&mut self, path: PathBuf) { self.cancel_path = Some(path); }
@@ -384,6 +394,8 @@ impl Store {
 
     fn apply_stage(&mut self, root: &str, outcome: &ScanOutcome,
         control: &mut dyn FnMut() -> Result<()>) -> Result<i64> {
+        ensure!(self.verification_context.is_none() || outcome.mode==ScanMode::Incremental,
+            "Verification commits must be incremental");
         let preparing = Instant::now();
         let cp = &outcome.checkpoint;
         let old_cp = self.checkpoint(root)?;
@@ -429,6 +441,15 @@ impl Store {
         self.db.execute("INSERT INTO scans(id,root,volume,finished,mode,total,free,logical,allocated,file_count,warnings,sampled,details,aggregate) VALUES(?,?,?,?,?,?,?,0,0,0,?,?,1,2)",
             params![scan, root, cp.volume_id, outcome.sampled_at, if outcome.mode == ScanMode::Full { "full" } else { "incremental" },
                 outcome.total as i64, outcome.free as i64, serde_json::to_string(&outcome.warnings)?, outcome.sampled_at])?;
+        self.db.execute("UPDATE scans SET comparison_from=(SELECT CASE WHEN cleanup_pending=0 THEN last_scan END FROM scan_baselines WHERE volume=?) WHERE id=?",params![cp.volume_id,scan])?;
+        self.db.execute("INSERT INTO scan_baselines(volume,last_scan,cleanup_pending) VALUES(?,?,0) ON CONFLICT(volume) DO UPDATE SET last_scan=excluded.last_scan,cleanup_pending=0",params![cp.volume_id,scan])?;
+        if let Some((pre,run)) = &self.verification_context {
+            if let Some(pre)=pre {
+                self.db.execute("UPDATE scans SET operation_pre=?,verification='verified' WHERE id=?",params![pre,scan])?;
+                self.db.execute("UPDATE scans SET verification='verified' WHERE id=?",[pre])?;
+            }
+            self.db.execute("UPDATE cleanup_runs SET payload=json_set(payload,'$.post_scan',?,'$.verification','verified') WHERE id=?",params![scan,run])?;
+        }
         let old_total: (i64, i64, i64) = self.db.query_row(
             "SELECT logical,allocated,files FROM volume_totals WHERE volume=?", [&cp.volume_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?.unwrap_or_default();
@@ -844,7 +865,9 @@ impl Store {
     pub fn reports(&self) -> Result<Vec<Report>> {
         let version: i64 = self.db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let performance = if version >= 6 { "performance" } else { "NULL" };
-        let mut stmt = self.db.prepare(&format!("SELECT id,root,volume,finished,mode,total,free,logical,allocated,file_count,warnings,sampled,details,aggregate,{performance} FROM scans ORDER BY id DESC"))?;
+        let operation = if version >= 8 {"operation_pre,verification"} else {"NULL,'not_needed'"};
+        let baseline=if version>=10 {"comparison_from"} else {"NULL"};
+        let mut stmt = self.db.prepare(&format!("SELECT id,root,volume,finished,mode,total,free,logical,allocated,file_count,warnings,sampled,details,aggregate,{performance},{operation},{baseline} FROM scans ORDER BY id DESC"))?;
         let mut rows = stmt.query([])?;
         let mut reports = vec![];
         while let Some(r) = rows.next()? {
@@ -852,7 +875,8 @@ impl Store {
                 total: r.get::<_, i64>(5)? as u64, free: r.get::<_, i64>(6)? as u64, logical: r.get::<_, i64>(7)? as u64,
                 allocated: r.get::<_, i64>(8)? as u64, file_count: r.get::<_, i64>(9)? as u64, warnings: serde_json::from_str(&r.get::<_, String>(10)?)?,
                 sampled: r.get(11)?, details: r.get::<_, i64>(12)? != 0, aggregate: r.get::<_, i64>(13)? as u8,
-                performance: r.get::<_, Option<String>>(14)?.map(|json| serde_json::from_str(&json)).transpose()? });
+                performance: r.get::<_, Option<String>>(14)?.map(|json| serde_json::from_str(&json)).transpose()?,
+                operation_pre:r.get(15)?,verification:r.get(16)?,comparison_from:r.get(17)? });
         }
         Ok(reports)
     }
