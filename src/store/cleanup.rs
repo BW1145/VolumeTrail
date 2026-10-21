@@ -74,9 +74,21 @@ impl Store {
         Ok((total,items))
     }
     pub fn cleanup_items(&self,id:&str)->Result<Vec<RunItem>> {
-        let mut stmt=self.db.prepare("SELECT path,state,reason,allocated FROM cleanup_items WHERE run=? ORDER BY seq LIMIT ?")?;
+        let mut stmt=self.db.prepare("SELECT path,state,reason,allocated FROM cleanup_items WHERE run=? ORDER BY (state IN ('pending','unknown')) DESC,(state='failed') DESC,seq LIMIT ?")?;
         Ok(stmt.query_map(params![id,MAX_DETAILS],|r|Ok(RunItem {path:r.get(0)?,state:r.get(1)?,reason:r.get(2)?,allocated_bytes:r.get(3)?}))?
             .collect::<rusqlite::Result<_>>()?)
+    }
+    pub fn cleanup_item_counts(&self,id:&str)->Result<(u64,u64,u64)> {
+        Ok(self.db.query_row("SELECT COUNT(*),COALESCE(SUM(state='pending'),0),COALESCE(SUM(state='unknown'),0) FROM cleanup_items WHERE run=?",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?)
+    }
+    pub fn observed_cleanup_run(&self,id:&str,active:bool)->Result<Run> {
+        let mut run=self.cleanup_run(id)?;
+        if run.state=="running" && !active {
+            let (_,pending,unknown)=self.cleanup_item_counts(id)?;
+            run.state="interrupted".into();run.unknown=run.unknown.max(pending+unknown);
+            if run.unknown>0 || run.deleted>0 {run.verification="pending".into();}
+            run.message=Some("No matching active cleanup operation; interrupted state inferred without replay".into());
+        }Ok(run)
     }
     pub fn cleanup_due(&self,id:&str,date:&str)->Result<bool> {
         Ok(!self.db.query_row("SELECT EXISTS(SELECT 1 FROM cleanup_daily WHERE rule=? AND date=?)",params![id,date],|r|r.get::<_,bool>(0))?)

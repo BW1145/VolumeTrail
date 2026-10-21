@@ -74,7 +74,7 @@ pub fn execute(args: Vec<String>) -> Result<Value> {
                 "used_bytes": report.total.saturating_sub(report.free),
                 "indexed_bytes": report.allocated, "file_count": report.file_count,
                 "detail_available": report.details, "aggregate_quality": report.aggregate,
-                "performance": report.performance,"operation_pre":report.operation_pre,"verification":report.verification,
+                "performance": report.performance,"operation_pre":report.operation_pre,"verification":report.verification,"comparison_from":report.comparison_from,
             })).collect::<Vec<_>>();
             json!({"command":"summary","drive":root,"total":reports.len(),"offset":offset,"limit":limit,"items":items})
         }

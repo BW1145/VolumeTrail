@@ -1,3 +1,4 @@
+mod folder_picker;
 mod history;
 #[cfg(feature="ui-capture")]
 pub mod capture;
@@ -45,6 +46,7 @@ pub struct VolumeTrailApp {
     changes: Vec<Change>,
     growth: Vec<FolderGrowth>,
     compare_from: Option<i64>,
+    compare_explicit: bool,
     comparison_key: Option<(i64, i64, u8, u64)>,
     comparison_rx: Option<Receiver<((i64, i64, u8, u64), Result<(Vec<FolderGrowth>, Vec<Change>, (u64, u64, u64, u64), ExtensionBreakdown, u64, Option<FolderBreakdown>), String>)>>,
     comparison_coverage: Option<(u64, u64, u64, u64)>,
@@ -107,7 +109,7 @@ impl VolumeTrailApp {
             data, store, saved_config: config.clone(), config, drive: 'C', view: View::Overview,
             reports: Vec::new(), scan_count: 0, selected: None,
             history_selection: HashSet::new(), history_message: None, history_rx: None,
-            changes: Vec::new(), growth: Vec::new(), compare_from: None,
+            changes: Vec::new(), growth: Vec::new(), compare_from: None, compare_explicit:false,
             comparison_key: None, comparison_rx: None, comparison_coverage: None,
             comparison_path: None, comparison_breakdown: None, extensions: ExtensionBreakdown::default(), details_page: 0, details_total: 0,
             folder_depth: 5,
@@ -324,7 +326,7 @@ impl VolumeTrailApp {
                     for letter in 'A'..='Z' {
                         if PathBuf::from(format!("{letter}:\\")).exists()
                             && ui.selectable_value(&mut self.drive, letter, format!("{letter} 盘")).clicked()
-                        { self.selected = None; self.history_selection.clear(); self.breadcrumbs.clear(); self.refresh(); }
+                        { self.selected = None; self.compare_explicit=false;self.compare_from=None; self.history_selection.clear(); self.breadcrumbs.clear(); self.refresh(); }
                     }
                 });
             ui.separator();
@@ -399,53 +401,36 @@ impl VolumeTrailApp {
         ui.heading("空间变化");
         let reports: Vec<Report> = self.reports.iter()
             .filter(|report| report.root.starts_with(self.drive)).cloned().collect();
-        let Some(initial_end) = reports.iter().find(|report| Some(report.id) == self.selected).or_else(|| reports.first()) else {
-            ui.label("至少完成两次扫描后，才能比较文件夹增长。");
-            return;
+        let Some(initial)=reports.iter().find(|r|Some(r.id)==self.selected).or_else(||reports.first()) else {
+            ui.label("尚无扫描记录，完成两次扫描后可比较目录变化。");return;
         };
-        let mut end_id = initial_end.id;
-        let mut from_id = self.compare_from.unwrap_or_else(|| reports.iter()
-            .find(|report| report.id < end_id && report.volume == initial_end.volume)
-            .map_or(0, |report| report.id));
-        let starts: Vec<_> = reports.iter().filter(|report| report.id < end_id && report.volume == initial_end.volume).collect();
-        if !starts.iter().any(|report| report.id == from_id) {
-            from_id = starts.first().map_or(0, |report| report.id);
+        let mut end_id=initial.id;
+        if !self.compare_explicit {
+            end_id=initial.operation_pre.unwrap_or(initial.id);
+            self.compare_from=reports.iter().find(|r|r.id==end_id).and_then(|r|r.comparison_from);
         }
+        let Some(initial_end)=reports.iter().find(|r|r.id==end_id) else {ui.label("此操作的原扫描点已整理，默认比较不可用。");return;};
+        let starts:Vec<_>=reports.iter().filter(|r|r.id<end_id && r.volume==initial_end.volume).collect();
+        let mut from_id=self.compare_from.filter(|id|starts.iter().any(|r|r.id==*id)).unwrap_or(0);
+        let old_from=from_id;let old_end=end_id;
         ui.horizontal(|ui| {
             ui.label("从");
-            egui::ComboBox::from_id_salt("compare_from")
-                .selected_text(starts.iter().find(|report| report.id == from_id)
-                    .map_or_else(|| "选择扫描记录".into(), |report| scan_time(&report.finished)))
-                .show_ui(ui, |ui| {
-                    for report in &starts {
-                        ui.selectable_value(&mut from_id, report.id, scan_time(&report.finished));
-                    }
-                });
+            egui::ComboBox::from_id_salt("compare_from").selected_text(starts.iter().find(|r|r.id==from_id)
+                .map_or_else(||"选择起点".into(),|r|scan_time(&r.sampled))).show_ui(ui,|ui| {
+                for report in &starts {ui.selectable_value(&mut from_id,report.id,scan_time(&report.sampled));}
+            });
             ui.label("到");
-            egui::ComboBox::from_id_salt("compare_to")
-                .selected_text(scan_time(&initial_end.finished))
-                .show_ui(ui, |ui| {
-                    for report in &reports {
-                        ui.selectable_value(&mut end_id, report.id, scan_time(&report.finished));
-                    }
-                });
+            egui::ComboBox::from_id_salt("compare_to").selected_text(scan_time(&initial_end.sampled)).show_ui(ui,|ui| {
+                for report in &reports {ui.selectable_value(&mut end_id,report.id,scan_time(&report.sampled));}
+            });
         });
-        if Some(end_id) != self.selected {
-            self.selected = Some(end_id);
-            self.compare_from = None;
-            self.load_selected();
-        } else {
-            self.compare_from = Some(from_id);
-        }
-        let end = reports.iter().find(|report| report.id == end_id).unwrap();
-        let valid_starts: Vec<_> = reports.iter().filter(|report| report.id < end_id && report.volume == end.volume).collect();
-        let from_id = self.compare_from.filter(|id| valid_starts.iter().any(|report| report.id == *id))
-            .or_else(|| valid_starts.first().map(|report| report.id));
-        let Some(from_id) = from_id else {
-            ui.label("这条记录之前没有可比较的扫描。");
-            return;
+        if old_from!=from_id || old_end!=end_id {self.compare_explicit=true;self.comparison_key=None;}
+        self.selected=Some(end_id);
+        let end=reports.iter().find(|r|r.id==end_id).unwrap();
+        self.compare_from=(from_id>0 && reports.iter().any(|r|r.id==from_id && r.id<end_id && r.volume==end.volume)).then_some(from_id);
+        let Some(from_id)=self.compare_from else {
+            ui.colored_label(AMBER,"默认比较所需的扫描点已整理或不足。可手动选择已保存的两个时间点。");return;
         };
-        self.compare_from = Some(from_id);
         if let Some(path) = self.comparison_path.clone() {
             if ui.button("为此目录创建清理规则…").clicked() {self.new_cleanup_rule(path.clone());}
             ui.horizontal(|ui| {

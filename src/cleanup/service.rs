@@ -106,6 +106,10 @@ pub fn set_enabled(store:&Store,safety:&Safety,id:&str,revision:u64,plan_id:Opti
 /// Caller holds the operation lock for planning, deletion and any verification.
 /// Retrying an existing request only reads its run; it never replays items.
 pub fn execute_plan(store:&Store,safety:&Safety,plan:&Plan,request_id:&str,pre_scan:Option<i64>,automatic_date:Option<String>,cancelled:&dyn Fn()->bool)->Result<Run> {
+    execute_plan_observed(store,safety,plan,request_id,pre_scan,automatic_date,cancelled,&|_|Ok(()))
+}
+
+pub(crate) fn execute_plan_observed(store:&Store,safety:&Safety,plan:&Plan,request_id:&str,pre_scan:Option<i64>,automatic_date:Option<String>,cancelled:&dyn Fn()->bool,started:&dyn Fn(&Run)->Result<()>)->Result<Run> {
     ensure!(!request_id.is_empty() && request_id.len()<=128,"Request ID must contain 1-128 UTF-8 bytes");
     if let Some(run)=store.cleanup_request(request_id)? {
         if run.plan_id!=plan.plan_id {return Err(fault("request_conflict","Request ID already belongs to another plan"));}
@@ -119,8 +123,11 @@ pub fn execute_plan(store:&Store,safety:&Safety,plan:&Plan,request_id:&str,pre_s
         started_at:chrono::Utc::now().timestamp(),finished_at:None,state:"running".into(),verification:"not_needed".into(),
         deleted:0,skipped:0,failed:0,unknown:0,allocated_bytes_estimate:0,
         free_before:crate::scanner::disk_space(root).ok().map(|v|v.1),free_after:None,free_observed_at:None,
-        details_trimmed:plan.candidate_count>MAX_DETAILS,message:None};
+        details_trimmed:false,message:None};
     store.start_cleanup_run(&run)?;
+    started(&run)?;
+    let previous_pending=store.cleanup_baseline_pending(&run.volume_id)?;
+    if !plan.candidates.is_empty() {store.mark_cleanup_baseline_pending(&run.volume_id,true)?;}
     let mut seen=HashSet::new();
     for (seq,candidate) in plan.candidates.iter().enumerate() {
         if cancelled() {run.state="cancelled".into();break;}
@@ -151,10 +158,12 @@ pub fn execute_plan(store:&Store,safety:&Safety,plan:&Plan,request_id:&str,pre_s
             }
         }
         // If this write fails, the durable pending row is intentionally left for recovery.
+        run.details_trimmed=run.deleted+run.skipped+run.failed>MAX_DETAILS as u64;
         store.record_cleanup_item(&run,seq,&item)?;
     }
     if run.state=="running" {run.state=if run.failed>0 || run.skipped>0 || plan.truncated {"partial"} else {"completed"}.into();}
     run.verification=if run.deleted>0 || run.unknown>0 {"pending"} else {"not_needed"}.into();
+    if run.deleted==0 && run.unknown==0 {store.mark_cleanup_baseline_pending(&run.volume_id,previous_pending)?;}
     run.finished_at=Some(chrono::Utc::now().timestamp());
     run.free_after=crate::scanner::disk_space(root).ok().map(|v|v.1);
     run.free_observed_at=Some(chrono::Local::now().to_rfc3339());

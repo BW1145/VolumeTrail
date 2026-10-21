@@ -43,6 +43,7 @@ pub struct Report {
     pub performance: Option<ScanPerformance>,
     pub operation_pre: Option<i64>,
     pub verification: String,
+    pub comparison_from: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -245,6 +246,8 @@ impl Store {
         }
         Self::migrate_operations(&db)?;
         Self::migrate_cleanup(&db)?;
+        Self::migrate_baselines(&db)?;
+        Self::migrate_pending_baselines(&db)?;
         Ok(Self { db, path: path.to_path_buf(), staging: false, verification_context: None, cancel_path: None, commit_timings: CommitTimings::default() })
     }
 
@@ -438,6 +441,8 @@ impl Store {
         self.db.execute("INSERT INTO scans(id,root,volume,finished,mode,total,free,logical,allocated,file_count,warnings,sampled,details,aggregate) VALUES(?,?,?,?,?,?,?,0,0,0,?,?,1,2)",
             params![scan, root, cp.volume_id, outcome.sampled_at, if outcome.mode == ScanMode::Full { "full" } else { "incremental" },
                 outcome.total as i64, outcome.free as i64, serde_json::to_string(&outcome.warnings)?, outcome.sampled_at])?;
+        self.db.execute("UPDATE scans SET comparison_from=(SELECT CASE WHEN cleanup_pending=0 THEN last_scan END FROM scan_baselines WHERE volume=?) WHERE id=?",params![cp.volume_id,scan])?;
+        self.db.execute("INSERT INTO scan_baselines(volume,last_scan,cleanup_pending) VALUES(?,?,0) ON CONFLICT(volume) DO UPDATE SET last_scan=excluded.last_scan,cleanup_pending=0",params![cp.volume_id,scan])?;
         if let Some((pre,run)) = &self.verification_context {
             if let Some(pre)=pre {
                 self.db.execute("UPDATE scans SET operation_pre=?,verification='verified' WHERE id=?",params![pre,scan])?;
@@ -861,7 +866,8 @@ impl Store {
         let version: i64 = self.db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let performance = if version >= 6 { "performance" } else { "NULL" };
         let operation = if version >= 8 {"operation_pre,verification"} else {"NULL,'not_needed'"};
-        let mut stmt = self.db.prepare(&format!("SELECT id,root,volume,finished,mode,total,free,logical,allocated,file_count,warnings,sampled,details,aggregate,{performance},{operation} FROM scans ORDER BY id DESC"))?;
+        let baseline=if version>=10 {"comparison_from"} else {"NULL"};
+        let mut stmt = self.db.prepare(&format!("SELECT id,root,volume,finished,mode,total,free,logical,allocated,file_count,warnings,sampled,details,aggregate,{performance},{operation},{baseline} FROM scans ORDER BY id DESC"))?;
         let mut rows = stmt.query([])?;
         let mut reports = vec![];
         while let Some(r) = rows.next()? {
@@ -870,7 +876,7 @@ impl Store {
                 allocated: r.get::<_, i64>(8)? as u64, file_count: r.get::<_, i64>(9)? as u64, warnings: serde_json::from_str(&r.get::<_, String>(10)?)?,
                 sampled: r.get(11)?, details: r.get::<_, i64>(12)? != 0, aggregate: r.get::<_, i64>(13)? as u8,
                 performance: r.get::<_, Option<String>>(14)?.map(|json| serde_json::from_str(&json)).transpose()?,
-                operation_pre:r.get(15)?,verification:r.get(16)? });
+                operation_pre:r.get(15)?,verification:r.get(16)?,comparison_from:r.get(17)? });
         }
         Ok(reports)
     }

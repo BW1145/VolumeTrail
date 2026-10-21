@@ -39,7 +39,7 @@ impl VolumeTrailApp {
                     let label=format!("{} · {} · {} 已用",scan_time(&primary.unwrap_or(latest).sampled),
                         scan_mode_label(&primary.unwrap_or(latest).mode),bytes(latest.total.saturating_sub(latest.free)));
                     if ui.add_enabled(primary.is_some(),egui::Button::new(label)).on_hover_text("查看此操作清理前的空间变化").clicked() {
-                        self.selected=Some(*pre);self.compare_from=None;self.comparison_path=None;self.comparison_key=None;self.view=View::Changes;
+                        self.selected=Some(*pre);self.compare_from=None;self.compare_explicit=false;self.comparison_path=None;self.comparison_key=None;self.view=View::Changes;
                     }
                     ui.menu_button(format!("{} 个观测 ▾",items.len()),|ui| {
                         for report in items.iter().rev() {

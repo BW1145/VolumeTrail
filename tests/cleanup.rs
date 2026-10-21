@@ -167,6 +167,33 @@ fn cleanup_detail_caps_and_retention_keep_summaries() {
 }
 
 #[test]
+fn interrupted_pending_after_200_terminal_rows_is_counted_and_visible() {
+    let (_temp,store,safety,rule)=fixture();let plan=preview(&store,&safety,&[rule.id],&||false).unwrap();
+    let mut run=execute_plan(&store,&safety,&plan,"pending-201",None,None,&||true).unwrap();run.state="running".into();run.unknown=0;
+    for i in 0..200 {store.record_cleanup_item(&run,i,&RunItem {path:format!("fixture-{i}"),state:"deleted".into(),reason:None,allocated_bytes:1}).unwrap();}
+    store.record_cleanup_item(&run,200,&RunItem {path:"pending-at-boundary".into(),state:"pending".into(),reason:None,allocated_bytes:1}).unwrap();
+    assert_eq!(store.cleanup_item_counts(&run.run_id).unwrap(),(201,1,0));
+    let items=store.cleanup_items(&run.run_id).unwrap();assert_eq!(items.len(),200);assert_eq!(items[0].state,"pending");
+    let observed=store.observed_cleanup_run(&run.run_id,false).unwrap();assert_eq!(observed.unknown,1);assert_eq!(observed.state,"interrupted");
+    store.recover_cleanup_runs().unwrap();assert_eq!(store.cleanup_run(&run.run_id).unwrap().unknown,1);assert_eq!(store.cleanup_items(&run.run_id).unwrap()[0].state,"unknown");
+}
+
+#[test]
+fn cleanup_run_count_and_365_day_retention_boundaries_are_exact() {
+    let (_temp,store,safety,rule)=fixture();let plan=preview(&store,&safety,&[rule.id],&||false).unwrap();
+    let template=execute_plan(&store,&safety,&plan,"template",None,None,&||false).unwrap();let now=chrono::Utc::now().timestamp();
+    for (name,age) in [("exact-365",365*86400),("over-365",365*86400+1)] {
+        let mut run=template.clone();run.run_id=name.into();run.request_id=name.into();run.started_at=now-age;store.start_cleanup_run(&run).unwrap();
+    }
+    store.prune_cleanup(now).unwrap();assert!(store.cleanup_run("exact-365").is_ok());assert!(store.cleanup_run("over-365").is_err());
+    for i in 0..1001 {
+        let mut run=template.clone();run.run_id=format!("count-{i:04}");run.request_id=run.run_id.clone();run.started_at=now-i;store.start_cleanup_run(&run).unwrap();
+    }
+    store.prune_cleanup(now).unwrap();assert_eq!(store.cleanup_runs(None,500,0).unwrap().0,1000);
+    assert!(store.cleanup_run("count-0000").is_ok());assert!(store.cleanup_run("count-1000").is_err());
+}
+
+#[test]
 fn long_paths_and_locked_ancestor_namespace_are_supported() {
     let (_temp,store,safety,mut rule)=fixture();let mut deep=std::path::PathBuf::from(&rule.directory);
     for _ in 0..6 {deep.push("长路径 sample directory 0123456789");}

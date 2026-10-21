@@ -55,14 +55,11 @@ fn execute(args:Vec<String>)->Result<Value> {
             "list"=>Ok(json!({"rules":store.cleanup_rules()?})),
             "get"=>Ok(json!({"rule":store.cleanup_rule(required("--id")?)?})),
             "status"=>{
-                let id=required("--id")?;let mut run=store.cleanup_run(id)?;let items=store.cleanup_items(id)?;
-                let active=worker::operation_active_read_only(&data);
-                if run.state=="running" && !active {
-                    run.state="interrupted".into();run.unknown+=items.iter().filter(|i|i.state=="pending").count() as u64;
-                    if run.unknown>0 || run.deleted>0 {run.verification="pending".into();}
-                    run.message=Some("No operation lock is held; interrupted state inferred without replay or database writes".into());
-                }
-                Ok(json!({"run":run,"items":items,"operation_active":active}))
+                let id=required("--id")?;let active=worker::cleanup_is_active(&data,id);
+                let run=store.observed_cleanup_run(id,active)?;let items=store.cleanup_items(id)?;
+                let (item_total,pending,unknown)=store.cleanup_item_counts(id)?;
+                Ok(json!({"run":run,"items":items,"item_total":item_total,"items_has_more":item_total>items.len() as u64,
+                    "pending_items":pending,"unknown_items":unknown,"operation_active":active}))
             }
             _=>{
                 let limit=options.get("--limit").map(|s|s.parse::<u64>()).transpose()?.unwrap_or(50);
@@ -78,9 +75,7 @@ fn execute(args:Vec<String>)->Result<Value> {
     }
     if command=="cancel" {
         let run=Store::open_read_only(&worker::store_path(&data))?.cleanup_run(required("--id")?)?;
-        let active=worker::operation_active_read_only(&data);
-        let cancel=active && (run.state=="running" || run.verification=="pending");
-        if cancel {let letter=run.rules[0].directory.chars().next().unwrap();worker::stop_scan(&data,letter)?;}
+        let cancel=worker::cancel_cleanup(&data,&run.run_id)?;
         return Ok(json!({"run_id":run.run_id,"cancel_requested":cancel}));
     }
     ensure!(["save","preview","enable","pause","delete"].contains(&command.as_str()),"Unknown cleanup command");

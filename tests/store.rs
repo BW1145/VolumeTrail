@@ -776,3 +776,46 @@ fn overview_groups_verification_and_preserves_real_observations() {
     drop(store);
     Store::open(&dir.path().join("history.db")).unwrap(); // migration is idempotent
 }
+
+#[test]
+fn deleting_previous_final_observation_never_falls_back_to_its_pre_cleanup_point() {
+    let dir=tempfile::tempdir().unwrap();let mut store=Store::open(&dir.path().join("history.db")).unwrap();
+    let a=store.publish("C:\\",&[file(30,"a.bin",100)],&outcome(ScanMode::Full,10)).unwrap();
+    let a_post=store.publish("C:\\",&[file(30,"a.bin",50)],&outcome(ScanMode::Incremental,20)).unwrap();store.mark_verification(a,"verified",Some(a_post)).unwrap();
+    let b=store.publish("C:\\",&[file(30,"a.bin",150)],&outcome(ScanMode::Incremental,30)).unwrap();
+    let b_post=store.publish("C:\\",&[file(30,"a.bin",120)],&outcome(ScanMode::Incremental,40)).unwrap();store.mark_verification(b,"verified",Some(b_post)).unwrap();
+    assert_eq!(store.default_interval(&store.reports().unwrap()).unwrap(),Some((a_post,b)));
+    store.delete_scans(&[a_post]).unwrap();
+    assert_eq!(store.default_interval(&store.reports().unwrap()).unwrap(),None);
+    assert!(volumetrail::overview::load(&store,"C:\\").unwrap().interval.is_none());
+    // Deleting the latest observation before a future scan must also preserve the missing ID.
+    store.delete_scans(&[b_post]).unwrap();
+    let c=store.publish("C:\\",&[file(30,"a.bin",160)],&outcome(ScanMode::Incremental,50)).unwrap();
+    assert_eq!(store.reports().unwrap()[0].comparison_from,Some(b_post));
+    assert_eq!(store.default_interval(&store.reports().unwrap()).unwrap(),None);
+    assert!(store.folder_growth("volume-A",a,c,5).is_ok()); // explicit retained-point comparisons remain available
+}
+
+#[test]
+fn legacy_baseline_migration_keeps_provable_pairs_and_refuses_deleted_post_gaps() {
+    for delete_post in [false,true] {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("history.db");let mut store=Store::open(&path).unwrap();
+        let a=store.publish("C:\\",&[file(30,"a.bin",100)],&outcome(ScanMode::Full,10)).unwrap();
+        let a_post=store.publish("C:\\",&[file(30,"a.bin",50)],&outcome(ScanMode::Incremental,20)).unwrap();store.mark_verification(a,"verified",Some(a_post)).unwrap();
+        let b=store.publish("C:\\",&[file(30,"a.bin",150)],&outcome(ScanMode::Incremental,30)).unwrap();
+        if delete_post {store.delete_scans(&[a_post]).unwrap();}drop(store);
+        let db=rusqlite::Connection::open(&path).unwrap();db.execute_batch("ALTER TABLE scans DROP COLUMN comparison_from;DROP TABLE scan_baselines;PRAGMA user_version=9;").unwrap();drop(db);
+        let store=Store::open(&path).unwrap();assert_eq!(store.default_interval(&store.reports().unwrap()).unwrap(),if delete_post {None} else {Some((a_post,b))});
+    }
+}
+
+#[test]
+fn unverified_cleanup_does_not_masquerade_as_growth_in_the_next_operation() {
+    let dir=tempfile::tempdir().unwrap();let mut store=Store::open(&dir.path().join("history.db")).unwrap();
+    store.publish("C:\\",&[file(30,"a.bin",100)],&outcome(ScanMode::Full,10)).unwrap();
+    store.mark_cleanup_baseline_pending("volume-A",true).unwrap();
+    let next=store.publish("C:\\",&[Mutation::Delete(30)],&outcome(ScanMode::Incremental,20)).unwrap();
+    assert!(store.default_interval(&store.reports().unwrap()).unwrap().is_none());
+    let following=store.publish("C:\\",&[file(31,"b.bin",50)],&outcome(ScanMode::Incremental,30)).unwrap();
+    assert_eq!(store.default_interval(&store.reports().unwrap()).unwrap(),Some((next,following)));
+}

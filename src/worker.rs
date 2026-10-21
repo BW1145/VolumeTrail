@@ -85,6 +85,32 @@ pub fn operation_active_read_only(data:&Path)->bool {
         .any(|path|path.exists() && OpenOptions::new().read(true).share_mode(0).open(path).is_err())
 }
 
+#[derive(Clone,Debug,Serialize,Deserialize)]
+pub(crate) struct ActiveCleanup {pub run_id:String,pub request_id:String,pub drive:char}
+pub(crate) fn active_cleanup(data:&Path)->Option<ActiveCleanup> {
+    fs::read(data.join("active-cleanup.json")).ok().and_then(|v|serde_json::from_slice(&v).ok())
+}
+pub(crate) fn set_active_cleanup(data:&Path,run:Option<&crate::cleanup::Run>)->Result<()> {
+    let path=data.join("active-cleanup.json");
+    if let Some(run)=run {
+        crate::atomic::write(&path,&serde_json::to_vec(&ActiveCleanup {run_id:run.run_id.clone(),request_id:run.request_id.clone(),drive:run.rules[0].directory.chars().next().unwrap().to_ascii_uppercase()})?)?;
+    } else if path.exists() {fs::remove_file(path)?;}
+    Ok(())
+}
+pub fn cleanup_is_active(data:&Path,run_id:&str)->bool {
+    operation_active_read_only(data) && active_cleanup(data).is_some_and(|active|active.run_id==run_id)
+}
+pub(crate) fn cleanup_cancel_path(data:&Path,run_id:&str)->PathBuf {
+    // Only application-generated GUIDs are used as filenames; callers pass a stored run ID.
+    data.join(format!("stop-cleanup-{run_id}.flag"))
+}
+pub fn cancel_cleanup(data:&Path,run_id:&str)->Result<bool> {
+    if !cleanup_is_active(data,run_id) {return Ok(false);}
+    fs::write(cleanup_cancel_path(data,run_id),b"stop")?;
+    // A concurrent completion/start cannot transfer this signal to another run.
+    Ok(true)
+}
+
 pub fn read_status(data: &Path, letter: char) -> Option<ScanStatus> {
     fs::read(status_path(data, letter)).ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -189,6 +215,7 @@ fn run_scan_locked(letter: char, data: &Path, budget: u64, automatic: bool) -> R
     let letter = letter.to_ascii_uppercase();
     let stop = stop_path(data, letter);
     if stop.exists() { fs::remove_file(&stop)?; }
+    set_active_cleanup(data,None)?;
     let _lock = scan_lock(data, letter)?;
     let root = format!("{letter}:\\");
     let mut status = ScanStatus { root: root.clone(), phase: "开始扫描".into(), ..Default::default() };
@@ -280,6 +307,7 @@ fn run_scan_locked(letter: char, data: &Path, budget: u64, automatic: bool) -> R
     }
     write_status(data, letter, &status)?;
     eprintln!("{} {} in {:.1} seconds", chrono::Local::now().format("%H:%M:%S"), status.phase, started.elapsed().as_secs_f64());
+    let _=set_active_cleanup(data,None);
     result.map(|_| ())
 }
 

@@ -45,17 +45,18 @@ impl VolumeTrailApp {
             metric(&mut columns[0],"剩余空间",current.free_bytes,GREEN);
             metric(&mut columns[1],"总容量",current.total_bytes,INK);
             if columns.len() > 2 {
-                columns[2].label(RichText::new("本次扫描前空间变化").color(MUTED));
+                columns[2].label(RichText::new("与上次相比占用").color(MUTED));
                 columns[2].label(RichText::new(data.interval.as_ref().map(|i| signed_bytes(i.used_delta_bytes))
                     .unwrap_or_else(|| "暂无比较基线".into())).size(24.0));
             }
         });
         if ui.available_width()<=700.0 {
-            ui.label(format!("本次扫描前空间变化 {}",data.interval.as_ref().map(|i|signed_bytes(i.used_delta_bytes)).unwrap_or_else(||"暂无比较基线".into())));
+            ui.label(format!("与上次相比占用 {}",data.interval.as_ref().map(|i|signed_bytes(i.used_delta_bytes)).unwrap_or_else(||"暂无比较基线".into())));
         }
         ui.add_space(12.0);
         if let Some(interval) = &data.interval {
             ui.label(RichText::new(format!("{} → {}",scan_time(&interval.from_observed_at),scan_time(&interval.to_observed_at))).color(MUTED));
+            if data.verification!="not_needed" {ui.label(RichText::new("目录变化统计至本次清理前；清理结果见下方。").color(MUTED));}
             let (all,complete,available,_) = interval.coverage;
             if all == 0 || complete != all {
                 ui.colored_label(AMBER,format!("历史覆盖不足：完整目录汇总 {complete}/{all}，可用 {available}/{all}；排行仅代表已保存变化。"));
@@ -81,7 +82,7 @@ impl VolumeTrailApp {
                 if self.overview_state.expanded && items.len()>limit {ui.label(format!("显示前 {limit} 项，共 {} 项；完整排行见空间变化。",items.len()));}
             }
             if let Some(path) = chosen {
-                self.selected = Some(interval.to);
+                self.selected = Some(interval.to);self.compare_explicit=false;
                 self.compare_from = Some(interval.from);
                 self.comparison_path = Some(path);
                 self.comparison_key = None;
@@ -90,12 +91,14 @@ impl VolumeTrailApp {
             }
         } else { ui.colored_label(MUTED,"尚无前次扫描或基线已被删除；目录变化未知。"); }
         if data.verification != "not_needed" {
-            ui.collapsing("本次清理后核验",|ui| {
-                ui.label(format!("状态：{}",data.verification));
-                ui.label(format!("清理前扫描 {:?} · 最近有效扫描 {}",data.pre_cleanup_scan,data.latest.as_ref().map_or_else(|| "历史点已删除".into(),|r|r.id.to_string())));
-                ui.label(format!("最近有效观测 {}",current.observed_at));
-                if let Some(pre)=data.pre_cleanup_scan.and_then(|id|data.trend.iter().find(|r|r.id==id)) {ui.label(format!("清理前真实观测 {}",pre.sampled));}
-                if data.verification != "verified" { ui.colored_label(AMBER,"文件统计待下次扫描更新"); }
+            ui.collapsing("文件统计状态",|ui| {
+                ui.label(super::cleanup::verification_state(&data.verification));
+                ui.label(format!("最近更新 {}",scan_time(&current.observed_at)));
+                if let Some(pre)=data.pre_cleanup_scan.and_then(|id|data.trend.iter().find(|r|r.id==id)) {ui.label(format!("清理前观测 {}",scan_time(&pre.sampled)));}
+                ui.collapsing("技术详情",|ui| {
+                    ui.label(format!("原扫描 {:?}；最近有效扫描 {:?}",data.pre_cleanup_scan,data.latest.as_ref().map(|r|r.id)));
+                    ui.label(format!("最近观测原始时间 {}",current.observed_at));
+                });
             });
         }
         ui.add_space(14.0);
