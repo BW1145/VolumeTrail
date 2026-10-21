@@ -166,6 +166,7 @@ pub fn run_auto() -> Result<()> {
         if let Err(error) = run_scan_locked(letter, &data, budget, true) {
             failures.push(format!("{letter}: {error:#}"));
         }
+        if stop_path(&data,letter).exists() {break;} // a cancelled login operation must not clean subsequent volumes
     }
     ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
@@ -218,6 +219,7 @@ fn run_scan_locked(letter: char, data: &Path, budget: u64, automatic: bool) -> R
         }, &mut counters)?;
         status.commit_ms = commit_started.map(|instant: Instant| instant.elapsed().as_millis() as u64);
         let warnings = store.report_warnings(report)?;
+        if !warnings.is_empty() { status.warning = Some(warnings.join("；")); }
         let volume = store.checkpoint(&root)?.unwrap().volume_id;
         store.reconcile_cleanup_after_scan(&volume,report)?;
         let mut final_report = report;
@@ -225,13 +227,16 @@ fn run_scan_locked(letter: char, data: &Path, budget: u64, automatic: bool) -> R
             status.phase = "文件清理规则".into();
             write_status(data,letter,&status)?;
             match crate::worker_cleanup::automatic(data,&mut store,&root,report,&mut counters) {
-                Ok(Some(run)) => { final_report = run.post_scan.unwrap_or(report); if let Some(message)=run.message {append_warning(&mut status.warning,message);} }
+                Ok(Some(run)) => {
+                    final_report = run.post_scan.unwrap_or(report);
+                    if run.state!="completed" {append_warning(&mut status.warning,format!("Cleanup {}: deleted {}, skipped {}, failed {}, unknown {}",run.state,run.deleted,run.skipped,run.failed,run.unknown));}
+                    if let Some(message)=run.message {append_warning(&mut status.warning,message);}
+                }
                 Ok(None) => {}
                 Err(error) => append_warning(&mut status.warning,format!("Cleanup stopped: {error:#}")),
             }
         }
         store.prune_cleanup(chrono::Utc::now().timestamp())?;
-        if !warnings.is_empty() { status.warning = Some(warnings.join("；")); }
         status.phase = "整理历史".into();
         eprintln!("{} 整理历史", chrono::Local::now().format("%H:%M:%S"));
         write_status(data, letter, &status)?;

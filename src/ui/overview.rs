@@ -1,11 +1,12 @@
 use super::*;
 use crate::overview::{self as service, Overview};
+use std::sync::Arc;
 
 #[derive(Default)]
 pub(super) struct OverviewState {
     pub(super) key: Option<(char, i64, Option<i64>)>,
     rx: Option<Receiver<Result<Overview, String>>>,
-    value: Option<Result<Overview, String>>,
+    value: Option<Result<Arc<Overview>, String>>,
     expanded: bool,
 }
 
@@ -27,7 +28,7 @@ impl VolumeTrailApp {
         }
         if let Some(rx) = &self.overview_state.rx {
             match rx.try_recv() {
-                Ok(value) => { self.overview_state.value = Some(value); self.overview_state.rx = None; }
+                Ok(value) => { self.overview_state.value = Some(value.map(Arc::new)); self.overview_state.rx = None; }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.overview_state.value = Some(Err("概览查询中断".into())); self.overview_state.rx = None;
                 }
@@ -49,6 +50,9 @@ impl VolumeTrailApp {
                     .unwrap_or_else(|| "暂无比较基线".into())).size(24.0));
             }
         });
+        if ui.available_width()<=700.0 {
+            ui.label(format!("本次扫描前空间变化 {}",data.interval.as_ref().map(|i|signed_bytes(i.used_delta_bytes)).unwrap_or_else(||"暂无比较基线".into())));
+        }
         ui.add_space(12.0);
         if let Some(interval) = &data.interval {
             ui.label(RichText::new(format!("{} → {}",scan_time(&interval.from_observed_at),scan_time(&interval.to_observed_at))).color(MUTED));
@@ -60,7 +64,7 @@ impl VolumeTrailApp {
                 ui.strong("主要目录变化");
                 ui.toggle_value(&mut self.overview_state.expanded,"展开全部");
             });
-            let limit = if self.overview_state.expanded { usize::MAX } else { 4 };
+            let limit = if self.overview_state.expanded { 20 } else { 4 };
             let mut chosen = None;
             for (title,items,color) in [("增长", &data.growth,RED),("减少", &data.reductions,GREEN)] {
                 ui.colored_label(color,title);
@@ -74,6 +78,7 @@ impl VolumeTrailApp {
                         response.context_menu(|ui| { if ui.button("复制完整路径").clicked() { ui.ctx().copy_text(item.path.clone()); ui.close(); } });
                     });
                 }
+                if self.overview_state.expanded && items.len()>limit {ui.label(format!("显示前 {limit} 项，共 {} 项；完整排行见空间变化。",items.len()));}
             }
             if let Some(path) = chosen {
                 self.selected = Some(interval.to);
@@ -104,7 +109,7 @@ impl VolumeTrailApp {
                 }
             }
         });
-        self.space_chart(ui);
+        self.space_chart(ui,&data.trend);
         if let Some(run)=&data.latest_cleanup {
             ui.separator();
             ui.horizontal_wrapped(|ui| {
@@ -137,9 +142,8 @@ mod tests {
 }
 
 impl VolumeTrailApp {
-    fn space_chart(&mut self, ui: &mut egui::Ui) {
-        let mut reports: Vec<&Report> = self.reports.iter()
-            .filter(|item| item.root.starts_with(self.drive))
+    fn space_chart(&mut self, ui: &mut egui::Ui, source:&[Report]) {
+        let mut reports: Vec<&Report> = source.iter()
             .filter(|item| self.config.trend_days == 0 || DateTime::parse_from_rfc3339(&item.sampled)
                 .is_ok_and(|at| Local::now().signed_duration_since(at).num_days() < i64::from(self.config.trend_days)))
             .collect();

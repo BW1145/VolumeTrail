@@ -39,6 +39,11 @@ fn real_cli_json_pagination_rules_preview_execute_retry_and_failure() {
     let saved=invoke(&exe,&["cleanup","save","--input",rule_file.to_str().unwrap(),"--json"],0);assert_eq!(saved["rule"]["enabled"],false);
     let id=saved["rule"]["id"].as_str().unwrap();
     assert_eq!(invoke(&exe,&["cleanup","list","--json"],0)["rules"].as_array().unwrap().len(),1);
+    let mut stdin_child=Command::new(&exe).args(["cleanup","save","--input","-","--json"])
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    {use std::io::Write;let mut input=stdin_child.stdin.take().unwrap();input.write_all(&serde_json::to_vec(&json!({"name":"stdin 规则","directory":scope,"patterns":["*.tmp"]})).unwrap()).unwrap();}
+    let stdin_output=stdin_child.wait_with_output().unwrap();assert!(stdin_output.status.success());
+    let stdin_rule:Value=serde_json::from_slice(&stdin_output.stdout).unwrap();assert_eq!(stdin_rule["rule"]["enabled"],false);
     fs::write(scope.join("预览 文件.dmp"),b"dedicated sample").unwrap();
     let preview=invoke(&exe,&["cleanup","preview","--id",id,"--json"],0);let plan=preview["plan"]["plan_id"].as_str().unwrap();assert_eq!(preview["plan"]["candidate_count"],1);
     fs::write(scope.join("after.dmp"),b"must remain").unwrap();
@@ -60,6 +65,22 @@ fn real_cli_json_pagination_rules_preview_execute_retry_and_failure() {
     expired.plan_id=cleanup::new_id();expired.expires_at=chrono::Utc::now().timestamp()-1;store.save_cleanup_plan(&expired).unwrap();
     assert_eq!(invoke(&exe,&["cleanup","execute","--plan",&expired.plan_id,"--request","expired","--confirm-permanent-delete","--json"],4)["error"]["code"],"plan_expired");
     let rule=store.cleanup_rule(id).unwrap();assert!(!rule.enabled);
+    // Kill only this freshly spawned portable fixture during deletion. A retry
+    // returns the interrupted run and must not delete another surviving object.
+    for n in 0..500 {fs::write(scope.join(format!("crash-{n}.dmp")),b"disposable crash sample").unwrap();}
+    let preview=invoke(&exe,&["cleanup","preview","--id",id,"--json"],0);let crash_plan=preview["plan"]["plan_id"].as_str().unwrap();
+    let mut child=Command::new(&exe).args(["cleanup","execute","--plan",crash_plan,"--request","crash-request","--confirm-permanent-delete","--json"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let until=std::time::Instant::now()+std::time::Duration::from_secs(5);let mut observed=None;
+    while std::time::Instant::now()<until {
+        if let Some(run)=store.cleanup_request("crash-request").unwrap() {if run.state=="running" && run.deleted>0 {observed=Some(run);break;}}
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    child.kill().unwrap();child.wait().unwrap();let interrupted=observed.expect("observe real deletion before fixture interruption");
+    let count_before=fs::read_dir(&scope).unwrap().count();
+    let status=invoke(&exe,&["cleanup","status","--id",&interrupted.run_id,"--json"],4);assert_eq!(status["run"]["state"],"interrupted");
+    let retry=invoke(&exe,&["cleanup","execute","--plan",crash_plan,"--request","crash-request","--confirm-permanent-delete","--json"],4);
+    assert_eq!(retry["run"]["run_id"],interrupted.run_id);assert_eq!(fs::read_dir(&scope).unwrap().count(),count_before);
     // A physical verification point must not change default growth to a seconds-long cleanup interval.
     let third=store.publish(root,&[Mutation::Delete(30)],&checkpoint(&volume,30)).unwrap();store.mark_verification(second,"verified",Some(third)).unwrap();
     let growth=invoke(&exe,&["query","growth","--drive",drive,"--json"],0);assert_eq!((growth["from"].as_i64(),growth["to"].as_i64()),(Some(first),Some(second)));

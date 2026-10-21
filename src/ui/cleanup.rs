@@ -161,7 +161,8 @@ impl VolumeTrailApp {
         if !state.runs.is_empty() {
             ui.add_space(14.0);ui.separator();ui.strong("最近清理结果");
             for run in &state.runs {
-                if ui.button(format!("{} · {} · 删除 {} · 跳过 {} · 失败 {}",run.started_at,run_state(&run.state),run.deleted,run.skipped,run.failed)).clicked() {job=Some(Job::Result(run.run_id.clone()));}
+                if ui.button(format!("{} · {} · 删除 {} · 跳过 {} · 失败 {}",run_time(run.started_at),run_state(&run.state),run.deleted,run.skipped,run.failed)).clicked() {job=Some(Job::Result(run.run_id.clone()));}
+                ui.label(RichText::new(verification_state(&run.verification)).color(if run.verification=="verified" || run.verification=="not_needed" {MUTED} else {AMBER}));
             }
         }
         if let Some((run,items))=&state.result {
@@ -182,3 +183,20 @@ impl VolumeTrailApp {
 
 pub(super) fn run_state(value:&str)->&str {match value {"completed"=>"完成","partial"=>"部分完成","cancelled"=>"已取消","interrupted"=>"异常中断","running"=>"执行中",_=>value}}
 pub(super) fn verification_state(value:&str)->&str {match value {"verified"=>"已核验","verified_by_later_scan"=>"后续扫描已更新","not_needed"=>"无需核验","pending"=>"待核验","cancelled"|"unverified"=>"文件统计待下次扫描更新",_=>value}}
+
+#[cfg(feature="ui-capture")]
+pub(super) fn prepare_capture(app:&mut VolumeTrailApp,scope:&Path,scenario:&str)->Result<()> {
+    for name in ["一个 temporary.dmp","第二份 crash.dmp","keep.txt"] {std::fs::write(scope.join(name),vec![0u8;8192])?;}
+    let safety=Safety::for_data(&app.data)?;
+    let rule=service::save_rule(&app.store,&safety,CleanupRule {name:"样本转储文件".into(),directory:scope.to_str().unwrap().into(),patterns:vec!["*.dmp".into()],..Default::default()})?;
+    let plan=service::preview(&app.store,&safety,&[rule.id.clone()],&||false)?;
+    let state=&mut app.cleanup_state;state.loaded=true;state.rules=vec![rule.clone()];state.patterns="*.dmp".into();state.editor=Some(rule.clone());state.original=Some(rule);
+    if scenario=="preview" {state.plan=Some(plan);}
+    else if scenario=="result" {
+        let run=crate::worker_cleanup::execute(&app.data,&plan.plan_id,"visual-fixture")?;
+        state.runs=vec![run.clone()];state.result=Some((run.clone(),app.store.cleanup_items(&run.run_id)?));
+    } else if scenario=="error" {state.message=Some("样本错误：文件正在被其他程序占用，已跳过。请检查预览范围后重试。".into());}
+    app.view=View::Cleanup;Ok(())
+}
+
+fn run_time(timestamp:i64)->String {chrono::DateTime::from_timestamp(timestamp,0).map(|at|at.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string()).unwrap_or_else(|| "时间未知".into())}

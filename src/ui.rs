@@ -1,3 +1,5 @@
+#[cfg(feature="ui-capture")]
+pub mod capture;
 mod cleanup;
 mod overview;
 use crate::{config::AppConfig, startup::{self, StartupStatus}, store::{Change, ExtensionBreakdown, FolderBreakdown, FolderGrowth, FolderItem, RankedItem, Report, StorageUsage, Store}, worker};

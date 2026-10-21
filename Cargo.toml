@@ -5,6 +5,7 @@ edition = "2024"
 license = "GPL-3.0-only"
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
@@ -16,6 +17,13 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Storage_Fil
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+ui-capture = ["dep:image"]
+
+[[example]]
+name = "ui_capture"
+required-features = ["ui-capture"]
 
 [profile.release]
 lto = "thin"

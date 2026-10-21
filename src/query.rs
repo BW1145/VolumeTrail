@@ -4,9 +4,10 @@ use serde_json::{Value, json};
 
 pub fn run(args: Vec<String>) -> Result<()> {
     let machine = args.iter().any(|a| a == "--json");
+    let command=args.first().cloned();
     match execute(args) {
         Ok(result) => { if machine { println!("{}", serde_json::to_string(&result)?); } else { print_text(&result); } Ok(()) }
-        Err(error) => { if machine { println!("{}", json!({"schema_version":1,"ok":false,"status":"failed","error":{"code":"query_failed","message":format!("{error:#}")},"data":null})); } Err(error) }
+        Err(error) => { if machine { println!("{}", json!({"schema_version":1,"ok":false,"command":command,"status":"failed","error":{"code":"query_failed","message":format!("{error:#}")},"data":null})); } Err(error) }
     }
 }
 
@@ -113,7 +114,7 @@ pub fn execute(args: Vec<String>) -> Result<Value> {
                 "name":item.name,"directory":item.is_dir,"logical_bytes":item.logical,
                 "allocated_bytes":item.allocated,"files":item.files,
             })).collect::<Vec<_>>();
-            let comparison = if from.is_some() || to.is_some() {
+            let comparison = if from.is_some() || to.is_some() || default_interval.is_some() {
                 let end = to.or_else(|| if from.is_none() { default_interval.map(|i| i.1) } else { None }).or_else(|| reports.first().map(|r| r.id)).context("No scan points")?;
                 let start = from.or_else(|| if to.is_none() { default_interval.map(|i| i.0) } else { None }).or_else(|| reports.iter().find(|r| r.id < end).map(|r| r.id))
                     .context("At least two scan points are needed")?;
@@ -121,7 +122,7 @@ pub fn execute(args: Vec<String>) -> Result<Value> {
                     "Choose two existing scans on the same volume, earliest first");
                 let breakdown = store.folder_breakdown(volume, start, end, &folder_path)?;
                 let mut child_growth = breakdown.children;
-                child_growth.sort_by(|a, b| b.allocated_delta.abs().cmp(&a.allocated_delta.abs()));
+                child_growth.sort_by(|a, b| b.allocated_delta.abs().cmp(&a.allocated_delta.abs()).then_with(||a.path.cmp(&b.path)));
                 let children_total = child_growth.len();
                 let children = child_growth.into_iter().skip(offset as usize)
                     .take(limit as usize).map(|item| json!({"path":item.path,
@@ -168,6 +169,13 @@ pub fn execute(args: Vec<String>) -> Result<Value> {
 fn print_text(value: &Value) {
     let header = value.get("command").and_then(Value::as_str).unwrap_or("query");
     println!("{header} {}", value["drive"].as_str().unwrap_or(""));
+    if header=="overview" {
+        println!("observed={} free={} total={}",value["current_index"]["observed_at"],value["current_index"]["free_bytes"],value["current_index"]["total_bytes"]);
+        println!("comparison {} -> {}; coverage={}",value["interval"]["from"],value["interval"]["to"],value["interval"]["coverage"]);
+        for key in ["growth","reductions"] {if let Some(items)=value[key].as_array() {for item in items.iter().take(4) {
+            println!("{:+} bytes  {}",item["allocated_delta"].as_i64().unwrap_or(0),item["path"].as_str().unwrap_or(""));
+        }}}
+    }
     if header == "growth" {
         println!("{} -> {}; folder coverage {}/{} (complete {}), file detail {}/{}",
             value["from"],value["to"],value["available_aggregate_intervals"],value["intervals"],

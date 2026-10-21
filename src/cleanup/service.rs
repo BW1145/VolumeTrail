@@ -11,7 +11,7 @@ pub fn save_rule(store:&Store,safety:&Safety,mut rule:Rule)->Result<Rule> {
     ensure!(rule.volume_id==volume,"Volume identity mismatch");
     safety.validate(&rule)?;
     let expected=rule.revision;
-    if rule.id.is_empty() {ensure!(expected==0,"New rules must use revision 0");rule.id=new_id();}
+    if rule.id.is_empty() {ensure!(expected==0,"New rules must use revision 0");ensure!(store.cleanup_rules()?.len()<128,"At most 128 cleanup rules are supported");rule.id=new_id();}
     else if store.cleanup_rule(&rule.id)?.revision!=expected {return Err(fault("revision_conflict","Rule was changed; read it again"));}
     rule.revision=expected.checked_add(1).context("Rule revision overflow")?;
     rule.enabled=false;
@@ -25,13 +25,12 @@ pub fn plan_rules(rules:Vec<Rule>,safety:&Safety,now:i64,cancelled:&dyn Fn()->bo
     let mut plan=Plan {plan_id:new_id(),created_at:now,expires_at:now+PLAN_SECONDS,rules:rules.clone(),
         deletion_method:"permanent_delete".into(),candidate_count:0,allocated_bytes_estimate:0,candidates:Vec::new(),
         skipped_count:0,skip_reasons:BTreeMap::new(),skipped:Vec::new(),truncated:false,skip_details_truncated:false};
-    let mut found:HashMap<(u64,[u8;16]),usize>=HashMap::new();
-    let mut visited=0usize;
+    let mut planning=Planning::default();
     for rule in &rules {
         safety.validate(rule)?;
         let guard=windows::DirectoryGuard::open(&rule.directory)?;
         ensure!(guard.volume_id()==rule.volume_id,"Volume identity mismatch");
-        walk(&rule.directory,rule,&mut plan,&mut found,&mut visited,now,cancelled)?;
+        walk(&rule.directory,rule,&mut plan,&mut planning,now,cancelled,0)?;
     }
     plan.candidate_count=plan.candidates.len();
     plan.skip_details_truncated=plan.skipped_count>plan.skipped.len() as u64;
@@ -42,7 +41,10 @@ fn skip(plan:&mut Plan,path:&str,reason:&str) {
     plan.skipped_count+=1;*plan.skip_reasons.entry(reason.into()).or_default()+=1;
     if plan.skipped.len()<MAX_DETAILS {plan.skipped.push(Skip {path:path.into(),reason:reason.into()});}
 }
-fn walk(path:&str,rule:&Rule,plan:&mut Plan,found:&mut HashMap<(u64,[u8;16]),usize>,visited:&mut usize,now:i64,cancelled:&dyn Fn()->bool)->Result<()> {
+#[derive(Default)]
+struct Planning {found:HashMap<(u64,[u8;16]),usize>,visited:usize,candidate_bytes:usize}
+fn walk(path:&str,rule:&Rule,plan:&mut Plan,planning:&mut Planning,now:i64,cancelled:&dyn Fn()->bool,depth:usize)->Result<()> {
+    if planning.visited>=200_000 || depth>128 {plan.truncated=true;skip(plan,path,"traversal_limit");return Ok(());}
     if cancelled() {return Err(fault("cancelled","Preview cancelled"));}
     // Pin and validate this directory for the entire enumeration; child inspect pins its own chain.
     let _guard=match windows::DirectoryGuard::open(path) {Ok(g)=>g,Err(e)=>{skip(plan,path,&format!("directory_unavailable: {e:#}"));return Ok(());}};
@@ -51,25 +53,28 @@ fn walk(path:&str,rule:&Rule,plan:&mut Plan,found:&mut HashMap<(u64,[u8;16]),usi
     };
     for entry in entries {
         if cancelled() {return Err(fault("cancelled","Preview cancelled"));}
-        *visited+=1;if *visited>200_000 {plan.truncated=true;break;}
+        planning.visited+=1;if planning.visited>200_000 {plan.truncated=true;break;}
         let entry=match entry {Ok(e)=>e,Err(e)=>{skip(plan,path,&format!("entry_unavailable: {e}"));continue;}};
         let raw=entry.path();let Some(raw)=raw.to_str() else {skip(plan,path,"non_unicode_path");continue;};
         let raw=raw.strip_prefix(r"\\?\").unwrap_or(raw);
         let metadata=match entry.metadata() {Ok(m)=>m,Err(e)=>{skip(plan,raw,&format!("metadata_unavailable: {e}"));continue;}};
         use std::os::windows::fs::MetadataExt;
         if metadata.file_attributes() & 0x400 != 0 {skip(plan,raw,"reparse_point");continue;}
-        if metadata.is_dir() {if rule.recursive {walk(raw,rule,plan,found,visited,now,cancelled)?;}continue;}
+        if metadata.is_dir() {if rule.recursive {walk(raw,rule,plan,planning,now,cancelled,depth+1)?;}continue;}
         let name=entry.file_name();let Some(name)=name.to_str() else {skip(plan,raw,"non_unicode_name");continue;};
         if !rule.patterns.iter().any(|p|filename_matches(name,p)) {skip(plan,raw,"filename_mismatch");continue;}
         let snapshot=match windows::inspect(raw) {Ok(s)=>s,Err(e)=>{skip(plan,raw,&format!("file_unavailable: {e:#}"));continue;}};
         if snapshot.identity.volume_id()!=rule.volume_id {skip(plan,raw,"volume_changed");continue;}
         if !old_enough(snapshot.modified_ticks,rule.min_age_days,now) {skip(plan,raw,"too_recent");continue;}
         let key=(snapshot.identity.volume,snapshot.identity.id);
-        if let Some(index)=found.get(&key) {if !plan.candidates[*index].rule_ids.contains(&rule.id) {plan.candidates[*index].rule_ids.push(rule.id.clone());}continue;}
-        if plan.candidates.len()>=MAX_CANDIDATES {plan.truncated=true;continue;}
-        found.insert(key,plan.candidates.len());
+        if let Some(index)=planning.found.get(&key) {if !plan.candidates[*index].rule_ids.contains(&rule.id) {plan.candidates[*index].rule_ids.push(rule.id.clone());}continue;}
+        let candidate=Candidate {path:raw.into(),snapshot:snapshot.clone(),rule_ids:vec![rule.id.clone()]};
+        let encoded_bytes=serde_json::to_vec(&candidate)?.len();
+        if plan.candidates.len()>=MAX_CANDIDATES || planning.candidate_bytes+encoded_bytes>8*1024*1024 {plan.truncated=true;continue;}
+        planning.candidate_bytes+=encoded_bytes;
+        planning.found.insert(key,plan.candidates.len());
         plan.allocated_bytes_estimate=plan.allocated_bytes_estimate.saturating_add(snapshot.allocated_bytes);
-        plan.candidates.push(Candidate {path:raw.into(),snapshot,rule_ids:vec![rule.id.clone()]});
+        plan.candidates.push(candidate);
     }Ok(())
 }
 

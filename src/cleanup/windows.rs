@@ -13,7 +13,9 @@ fn wide(value: &str) -> Vec<u16> {std::ffi::OsStr::new(value).encode_wide().chai
 fn handle(file: &File) -> HANDLE {HANDLE(file.as_raw_handle())}
 fn open(path: &str, directory: bool, delete: bool) -> Result<File> {
     let path=wide(&format!(r"\\?\{}",path.strip_prefix(r"\\?\").unwrap_or(path)));
-    let access=FILE_READ_ATTRIBUTES.0 | if delete {DELETE.0} else {0};
+    // Attribute-only opens do not enforce directory sharing restrictions on NTFS.
+    // LIST_DIRECTORY is necessary to prevent rename/reparse mutation while pinned.
+    let access=FILE_READ_ATTRIBUTES.0 | if directory {FILE_LIST_DIRECTORY.0} else {0} | if delete {DELETE.0} else {0};
     let share=if directory {FILE_SHARE_READ} else if delete {FILE_SHARE_MODE(0)} else {FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE};
     let h=unsafe {CreateFileW(PCWSTR(path.as_ptr()),access,share,None,OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS,None)}.context("Open object without following reparse points")?;

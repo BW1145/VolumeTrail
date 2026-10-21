@@ -42,8 +42,9 @@ impl Store {
         tx.commit()?;Ok(())
     }
     pub fn delete_cleanup_rule(&self,id:&str,revision:u64)->Result<()> {
-        ensure!(self.db.execute("DELETE FROM cleanup_rules WHERE id=? AND revision=?",params![id,revision])?==1,
-            "Rule missing or revision conflict");Ok(())
+        if self.db.execute("DELETE FROM cleanup_rules WHERE id=? AND revision=?",params![id,revision])?!=1 {
+            return Err(fault("revision_conflict","Rule missing or changed; read it again"));
+        }Ok(())
     }
     pub fn save_cleanup_plan(&self,plan:&Plan)->Result<()> {
         self.db.execute("DELETE FROM cleanup_plans WHERE expires<?",[chrono::Utc::now().timestamp()])?;
@@ -110,11 +111,13 @@ impl Store {
         let runs=stmt.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;drop(stmt);
         for value in runs {
             let mut run:Run=serde_json::from_str(&value)?;
-            run.unknown=self.db.query_row("SELECT COUNT(*) FROM cleanup_items WHERE run=? AND state='pending'",[&run.run_id],|r|r.get(0))?;
-            self.db.execute("UPDATE cleanup_items SET state='unknown',reason='Process interrupted; do not replay' WHERE run=? AND state='pending'",[&run.run_id])?;
+            let tx=self.db.unchecked_transaction()?;
+            run.unknown=tx.query_row("SELECT COUNT(*) FROM cleanup_items WHERE run=? AND state IN ('pending','unknown')",[&run.run_id],|r|r.get(0))?;
+            tx.execute("UPDATE cleanup_items SET state='unknown',reason='Process interrupted; do not replay' WHERE run=? AND state='pending'",[&run.run_id])?;
             run.state="interrupted".into();run.finished_at=Some(chrono::Utc::now().timestamp());
             if run.deleted>0 || run.unknown>0 {run.verification="pending".into();}
             self.update_cleanup_run(&run)?;
+            tx.commit()?;
         }Ok(())
     }
     pub fn prune_cleanup(&self,now:i64)->Result<()> {

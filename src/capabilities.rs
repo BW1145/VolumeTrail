@@ -12,7 +12,7 @@ pub fn value()->Value {json!({
         {"name":"scan","access":"scan","permissions":"NTFS volume access; scans only"},
         {"name":"scan-auto","access":"scan_and_delete","permissions":"existing login lifecycle; enabled rules only"}
     ],
-    "preview":{"expires_seconds":900,"candidate_limit":10000,"stored_plan_limit":32,"method":"permanent_delete","execution":"only revalidate previewed identities; never add newly appeared files"},
+    "preview":{"expires_seconds":900,"candidate_limit":10000,"candidate_json_bytes_limit":8388608,"traversal_entry_limit":200000,"recursion_depth_limit":128,"stored_plan_limit":32,"method":"permanent_delete","execution":"only revalidate previewed identities; never add newly appeared files"},
     "retention":{"item_limit_per_run":200,"item_days":30,"run_limit":1000,"run_days":365,"idempotency":"retained run summaries only; expired plans cannot be replayed"},
     "exit_codes":{"success":0,"failure":1,"partial_or_unverified":2,"cancelled":3,"conflict_or_interrupted":4},
     "authorization":"Command access, plan IDs, revisions and acknowledgement flags do not establish user authorization"

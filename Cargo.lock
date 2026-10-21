@@ -2892,6 +2892,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "eframe",
+ "image",
  "ntfs",
  "rusqlite",
  "serde",

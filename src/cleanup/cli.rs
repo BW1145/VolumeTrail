@@ -20,7 +20,7 @@ pub fn run(args:Vec<String>)->Result<()> {
         Err(error)=>{
             let code=error.downcast_ref::<Fault>().map_or("cleanup_failed",|e|e.code);
             (json!({"schema_version":1,"ok":false,"command":format!("cleanup {command}"),"status":"failed","data":null,
-                "error":{"code":code,"message":format!("{error:#}")}}),if code=="revision_conflict" || code=="plan_expired" {4} else {1})
+                "error":{"code":code,"message":format!("{error:#}")}}),if code.ends_with("_conflict") || code=="plan_expired" {4} else {1})
         }
     };
     if machine {println!("{}",serde_json::to_string(&value)?);}
@@ -78,8 +78,10 @@ fn execute(args:Vec<String>)->Result<Value> {
     }
     if command=="cancel" {
         let run=Store::open_read_only(&worker::store_path(&data))?.cleanup_run(required("--id")?)?;
-        if run.state=="running" {let letter=run.rules[0].directory.chars().next().unwrap();worker::stop_scan(&data,letter)?;}
-        return Ok(json!({"run_id":run.run_id,"cancel_requested":run.state=="running"}));
+        let active=worker::operation_active_read_only(&data);
+        let cancel=active && (run.state=="running" || run.verification=="pending");
+        if cancel {let letter=run.rules[0].directory.chars().next().unwrap();worker::stop_scan(&data,letter)?;}
+        return Ok(json!({"run_id":run.run_id,"cancel_requested":cancel}));
     }
     ensure!(["save","preview","enable","pause","delete"].contains(&command.as_str()),"Unknown cleanup command");
     fs::create_dir_all(&data)?;

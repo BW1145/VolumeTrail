@@ -389,6 +389,8 @@ impl Store {
 
     fn apply_stage(&mut self, root: &str, outcome: &ScanOutcome,
         control: &mut dyn FnMut() -> Result<()>) -> Result<i64> {
+        ensure!(self.verification_context.is_none() || outcome.mode==ScanMode::Incremental,
+            "Verification commits must be incremental");
         let preparing = Instant::now();
         let cp = &outcome.checkpoint;
         let old_cp = self.checkpoint(root)?;

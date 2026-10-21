@@ -3,6 +3,19 @@ use crate::{cleanup::{self,Plan,Run,Safety},model::ScanCounters,scanner::{self,S
 use anyhow::Result;
 use std::{fs,path::Path};
 
+fn execute_recorded(store:&Store,safety:&Safety,plan:&Plan,request:&str,pre:Option<i64>,date:Option<String>,cancelled:&dyn Fn()->bool)->Result<Run> {
+    match cleanup::execute_plan(store,safety,plan,request,pre,date,cancelled) {
+        Ok(run)=>Ok(run),
+        Err(error)=>{
+            store.recover_cleanup_runs()?;
+            if let Some(mut run)=store.cleanup_request(request)? {
+                run.message=Some(format!("Execution interrupted; pending results are unknown: {error:#}"));
+                store.update_cleanup_run(&run)?;Ok(run)
+            } else {Err(error)}
+        }
+    }
+}
+
 pub(crate) fn verify(data:&Path,store:&mut Store,plan:&Plan,run:&mut Run,counters:&mut ScanCounters)->Result<()> {
     if run.verification!="pending" {return Ok(());}
     let root=&plan.rules[0].directory[..3];let letter=root.chars().next().unwrap().to_ascii_uppercase();
@@ -39,7 +52,7 @@ pub(crate) fn automatic(data:&Path,store:&mut Store,root:&str,pre:i64,counters:&
     let safety=Safety::for_data(data)?;let letter=root.chars().next().unwrap();let stop=worker::stop_path(data,letter);
     let plan=cleanup::plan_rules(rules,&safety,chrono::Utc::now().timestamp(),&||stop.exists())?;
     let request=format!("auto-{}",cleanup::new_id());
-    let mut run=cleanup::execute_plan(store,&safety,&plan,&request,Some(pre),Some(date),&||stop.exists())?;
+    let mut run=execute_recorded(store,&safety,&plan,&request,Some(pre),Some(date),&||stop.exists())?;
     verify(data,store,&plan,&mut run,counters)?;
     Ok(Some(run))
 }
@@ -64,7 +77,7 @@ pub fn execute(data:&Path,plan_id:&str,request_id:&str)->Result<Run> {
     let result=(|| {
         let safety=Safety::for_data(data)?;
         let pre=store.reports()?.into_iter().find(|r|r.volume==plan.rules[0].volume_id).map(|r|r.id);
-        let mut run=cleanup::execute_plan(&store,&safety,&plan,request_id,pre,None,&||stop.exists())?;
+        let mut run=execute_recorded(&store,&safety,&plan,request_id,pre,None,&||stop.exists())?;
         let mut counters=ScanCounters::default();verify(data,&mut store,&plan,&mut run,&mut counters)?;
         store.prune_cleanup(chrono::Utc::now().timestamp())?;
         Ok(run)
@@ -75,4 +88,23 @@ pub fn execute(data:&Path,plan_id:&str,request_id:&str)->Result<Run> {
         Err(e)=>{status.phase="清理中断".into();status.error=Some(format!("{e:#}"));}
     }
     worker::write_status(data,letter,&status)?;result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn verification_keeps_the_operation_cancel_flag_and_never_starts_a_full_scan() {
+        let temp=tempfile::tempdir().unwrap();let data=temp.path().join("data");let scope=temp.path().join("sample");
+        fs::create_dir(&data).unwrap();fs::create_dir(&scope).unwrap();fs::write(scope.join("one.dmp"),b"temporary").unwrap();
+        let _lock=worker::global_scan_lock(&data).unwrap();let mut store=Store::open(&worker::store_path(&data)).unwrap();
+        let safety=Safety::for_data(&data).unwrap();
+        let rule=cleanup::save_rule(&store,&safety,cleanup::Rule {name:"test".into(),directory:scope.to_str().unwrap().into(),patterns:vec!["*.dmp".into()],..Default::default()}).unwrap();
+        let plan=cleanup::preview(&store,&safety,&[rule.id],&||false).unwrap();
+        let mut run=cleanup::execute_plan(&store,&safety,&plan,"cancel-verification",None,None,&||false).unwrap();
+        let letter=scope.to_str().unwrap().chars().next().unwrap().to_ascii_uppercase();let stop=worker::stop_path(&data,letter);fs::write(&stop,b"stop").unwrap();
+        verify(&data,&mut store,&plan,&mut run,&mut ScanCounters::default()).unwrap();
+        assert_eq!(run.verification,"cancelled");assert!(stop.exists());assert!(store.reports().unwrap().is_empty());
+        assert!(run.message.unwrap().contains("Scan cancelled"));
+    }
 }
