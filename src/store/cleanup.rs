@@ -2,6 +2,7 @@ use super::*;
 use crate::cleanup::{Plan,Rule,Run,RunItem,fault,MAX_DETAILS};
 
 impl Store {
+    pub fn cleanup_durable(&self)->Result<()> {self.db.pragma_update(None,"synchronous","FULL")?;Ok(())}
     pub(super) fn migrate_cleanup(db:&Connection)->Result<()> {
         if db.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0))?<9 {
             db.execute_batch("BEGIN IMMEDIATE;
@@ -124,5 +125,14 @@ impl Store {
         self.db.execute("DELETE FROM cleanup_runs WHERE state<>'running' AND (started<? OR id NOT IN (SELECT id FROM cleanup_runs ORDER BY started DESC LIMIT 1000))",[now-365*86400])?;
         self.db.execute("DELETE FROM cleanup_daily WHERE date<?",[chrono::Local::now().date_naive().checked_sub_signed(chrono::Duration::days(370)).unwrap().to_string()])?;
         Ok(())
+    }
+    pub fn reconcile_cleanup_after_scan(&self,volume:&str,scan:i64)->Result<()> {
+        for mut run in self.cleanup_runs(Some(volume),1000,0)?.1 {
+            if ["pending","unverified","cancelled"].contains(&run.verification.as_str()) && run.pre_scan.is_none_or(|pre|pre<scan) {
+                run.verification="verified_by_later_scan".into();
+                run.message=Some(format!("Current index refreshed by later scan {scan}; no cleanup replay"));
+                self.update_cleanup_run(&run)?;
+            }
+        }Ok(())
     }
 }

@@ -3,7 +3,7 @@ use crate::overview::{self as service, Overview};
 
 #[derive(Default)]
 pub(super) struct OverviewState {
-    key: Option<(char, i64, Option<i64>)>,
+    pub(super) key: Option<(char, i64, Option<i64>)>,
     rx: Option<Receiver<Result<Overview, String>>>,
     value: Option<Result<Overview, String>>,
     expanded: bool,
@@ -37,12 +37,12 @@ impl VolumeTrailApp {
         ui.heading(format!("{}: 磁盘概览",self.drive));
         let Some(value) = self.overview_state.value.clone() else { ui.spinner(); return; };
         let data = match value { Ok(v) => v, Err(e) => { ui.colored_label(RED,e); return; } };
-        let Some(latest) = &data.latest else { ui.label("还没有扫描记录。完成首次扫描后可查看容量与变化。"); return; };
-        ui.label(RichText::new(format!("最近观测 {}",scan_time(&latest.sampled))).color(MUTED));
+        let Some(current) = &data.current_index else { ui.label("还没有扫描记录。完成首次扫描后可查看容量与变化。"); return; };
+        ui.label(RichText::new(format!("最近观测 {}",scan_time(&current.observed_at))).color(MUTED));
         ui.add_space(10.0);
         ui.columns(if ui.available_width() > 700.0 {3} else {2}, |columns| {
-            metric(&mut columns[0],"剩余空间",latest.free,GREEN);
-            metric(&mut columns[1],"总容量",latest.total,INK);
+            metric(&mut columns[0],"剩余空间",current.free_bytes,GREEN);
+            metric(&mut columns[1],"总容量",current.total_bytes,INK);
             if columns.len() > 2 {
                 columns[2].label(RichText::new("本次扫描前空间变化").color(MUTED));
                 columns[2].label(RichText::new(data.interval.as_ref().map(|i| signed_bytes(i.used_delta_bytes))
@@ -87,8 +87,9 @@ impl VolumeTrailApp {
         if data.verification != "not_needed" {
             ui.collapsing("本次清理后核验",|ui| {
                 ui.label(format!("状态：{}",data.verification));
-                ui.label(format!("清理前扫描 {:?} · 最近有效扫描 {}",data.pre_cleanup_scan,latest.id));
-                ui.label(format!("最近有效观测 {}",latest.sampled));
+                ui.label(format!("清理前扫描 {:?} · 最近有效扫描 {}",data.pre_cleanup_scan,data.latest.as_ref().map_or_else(|| "历史点已删除".into(),|r|r.id.to_string())));
+                ui.label(format!("最近有效观测 {}",current.observed_at));
+                if let Some(pre)=data.pre_cleanup_scan.and_then(|id|data.trend.iter().find(|r|r.id==id)) {ui.label(format!("清理前真实观测 {}",pre.sampled));}
                 if data.verification != "verified" { ui.colored_label(AMBER,"文件统计待下次扫描更新"); }
             });
         }
@@ -104,7 +105,16 @@ impl VolumeTrailApp {
             }
         });
         self.space_chart(ui);
-        for warning in &latest.warnings { ui.colored_label(AMBER,warning); }
+        if let Some(run)=&data.latest_cleanup {
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("最近清理");
+                ui.label(format!("{} · 删除 {} 项 · 占用估算 {}",super::cleanup::run_state(&run.state),run.deleted,bytes(run.allocated_bytes_estimate)));
+                if ui.button("查看结果").clicked() {self.view=View::Cleanup;}
+            });
+            ui.label(super::cleanup::verification_state(&run.verification));
+        }
+        if let Some(latest)=&data.latest {for warning in &latest.warnings { ui.colored_label(AMBER,warning); }}
     }
 }
 

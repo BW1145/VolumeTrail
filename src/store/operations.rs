@@ -1,6 +1,9 @@
 use super::*;
 
 impl Store {
+    pub(crate) fn source_directory(&self)->Option<&Path> {self.path.parent()}
+    pub(crate) fn verification_context(&mut self,context:Option<(Option<i64>,String)>) {self.verification_context=context;}
+
     pub fn children_count(&self, volume: &str, parent: u64) -> Result<u64> {
         Ok(self.db.query_row("SELECT COUNT(*) FROM nodes WHERE volume=? AND parent=? AND id<>parent",
             params![volume,parent as i64],|r| r.get(0))?)

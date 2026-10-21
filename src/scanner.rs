@@ -182,6 +182,24 @@ pub fn scan_volume(
     progress: &mut dyn FnMut(ScanProgress),
     counters: &mut ScanCounters,
 ) -> Result<i64> {
+    scan_volume_with_policy(root,store,cancelled,progress,counters,ScanPolicy::AllowFull)
+}
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum ScanPolicy { AllowFull, RequireIncremental }
+
+pub fn enforce_scan_policy(policy:ScanPolicy,mode:ScanMode)->Result<()> {
+    if policy==ScanPolicy::RequireIncremental && mode!=ScanMode::Incremental {
+        return Err(crate::cleanup::fault("incremental_unavailable","Cleanup verification requires a valid USN checkpoint; full scan was refused"));
+    }
+    Ok(())
+}
+
+pub fn scan_volume_with_policy(
+    root:&str,store:&mut Store,cancelled:&dyn Fn()->bool,
+    progress:&mut dyn FnMut(ScanProgress),counters:&mut ScanCounters,policy:ScanPolicy,
+) -> Result<i64> {
+    if cancelled() {anyhow::bail!("Scan cancelled");}
     let letter = root.chars().next().context("Missing drive letter")?;
     ensure!(root.len() == 3 && root.as_bytes()[1..] == *b":\\", "Expected a drive root such as C:\\");
     let volume = Volume::open(letter)?;
@@ -192,6 +210,7 @@ pub fn scan_volume(
     let start = volume.journal()?;
     let previous = store.checkpoint(root)?;
     let (mode, full_reason) = scan_mode(previous.as_ref(), &volume_id, root_id, start);
+    enforce_scan_policy(policy,mode)?; // must precede pending reads, load monitoring and begin_stage
     let mut pending: HashSet<u64> = if mode == ScanMode::Incremental {
         store.pending(root)?.into_iter().collect()
     } else { HashSet::new() };
@@ -489,7 +508,7 @@ impl CpuLoad {
     }
 }
 
-fn disk_space(root: &str) -> Result<(u64, u64)> {
+pub fn disk_space(root: &str) -> Result<(u64, u64)> {
     let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
     let mut total = 0;
     let mut free = 0;

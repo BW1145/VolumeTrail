@@ -1,6 +1,7 @@
 //! Rules, planning and execution are shared by the GUI, CLI and login worker.
 pub mod windows;
 mod service;
+pub mod cli;
 pub use service::*;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -113,11 +114,18 @@ impl Safety {
         }
         let target = normal_path(&rule.directory)?;
         ensure!(target.len()>3,"Volume roots are protected");
+        let target_guard=windows::DirectoryGuard::open(&rule.directory)?;
         for path in &self.protected {
             let value = path.to_string_lossy();
             let canonical = windows::canonical_directory(&value).unwrap_or_else(|_| value.into_owned());
             let protected = normal_path(&canonical)?;
             ensure!(!within(&target,&protected) && !within(&protected,&target),"Protected directory overlaps cleanup scope: {canonical}");
+            if let Ok(guard)=windows::DirectoryGuard::open(&canonical) {
+                let target_id=target_guard.identities.last().unwrap();
+                let protected_id=guard.identities.last().unwrap();
+                ensure!(!target_guard.identities.contains(protected_id) && !guard.identities.contains(target_id),
+                    "Protected directory identity overlaps cleanup scope: {canonical}");
+            }
         }
         Ok(())
     }

@@ -97,3 +97,63 @@ pub fn set_enabled(store:&Store,safety:&Safety,id:&str,revision:u64,plan_id:Opti
     }
     rule.enabled=enabled;rule.revision+=1;store.save_cleanup_rule(&rule,revision)?;Ok(rule)
 }
+
+/// Caller holds the operation lock for planning, deletion and any verification.
+/// Retrying an existing request only reads its run; it never replays items.
+pub fn execute_plan(store:&Store,safety:&Safety,plan:&Plan,request_id:&str,pre_scan:Option<i64>,automatic_date:Option<String>,cancelled:&dyn Fn()->bool)->Result<Run> {
+    ensure!(!request_id.is_empty() && request_id.len()<=128,"Request ID must contain 1-128 UTF-8 bytes");
+    if let Some(run)=store.cleanup_request(request_id)? {
+        if run.plan_id!=plan.plan_id {return Err(fault("request_conflict","Request ID already belongs to another plan"));}
+        return Ok(run);
+    }
+    validate_plan(store,safety,plan,chrono::Utc::now().timestamp())?;
+    store.cleanup_durable()?;
+    let root=&plan.rules[0].directory[..3];
+    let mut run=Run {run_id:new_id(),request_id:request_id.into(),plan_id:plan.plan_id.clone(),rules:plan.rules.clone(),
+        volume_id:plan.rules[0].volume_id.clone(),pre_scan,post_scan:None,automatic_date,
+        started_at:chrono::Utc::now().timestamp(),finished_at:None,state:"running".into(),verification:"not_needed".into(),
+        deleted:0,skipped:0,failed:0,unknown:0,allocated_bytes_estimate:0,
+        free_before:crate::scanner::disk_space(root).ok().map(|v|v.1),free_after:None,free_observed_at:None,
+        details_trimmed:plan.candidate_count>MAX_DETAILS,message:None};
+    store.start_cleanup_run(&run)?;
+    let mut seen=HashSet::new();
+    for (seq,candidate) in plan.candidates.iter().enumerate() {
+        if cancelled() {run.state="cancelled".into();break;}
+        let key=(candidate.snapshot.identity.volume,candidate.snapshot.identity.id);
+        if !seen.insert(key) {continue;}
+        let permitted=plan.rules.iter().any(|r| {
+            let path=normal_path(&candidate.path);let directory=normal_path(&r.directory);
+            if let (Ok(path),Ok(directory))=(path,directory) {
+                candidate.rule_ids.contains(&r.id) && within(&path,&directory) && path!=directory
+                    && (r.recursive || Path::new(&path).parent()==Some(Path::new(&directory)))
+                    && Path::new(&candidate.path).file_name().and_then(|n|n.to_str()).is_some_and(|name|r.patterns.iter().any(|p|filename_matches(name,p)))
+                    && candidate.snapshot.identity.volume_id()==r.volume_id
+                    && old_enough(candidate.snapshot.modified_ticks,r.min_age_days,chrono::Utc::now().timestamp())
+            } else {false}
+        });
+        let mut item=RunItem {path:candidate.path.clone(),state:"pending".into(),reason:None,allocated_bytes:candidate.snapshot.allocated_bytes};
+        run.verification="pending".into();
+        store.record_cleanup_item(&run,seq,&item)?; // durable intent precedes any filesystem side effect
+        let deletion=if permitted {windows::delete_verified(&candidate.path,&candidate.snapshot)}
+            else {Err(fault("scope_changed","Candidate is outside the preview rule scope"))};
+        match deletion {
+            Ok(())=>{item.state="deleted".into();run.deleted+=1;run.allocated_bytes_estimate=run.allocated_bytes_estimate.saturating_add(item.allocated_bytes);}
+            Err(e)=>{
+                let reason=format!("{e:#}");
+                if reason.starts_with("Delete verified file handle") {item.state="failed".into();run.failed+=1;}
+                else {item.state="skipped".into();run.skipped+=1;}
+                item.reason=Some(reason);
+            }
+        }
+        // If this write fails, the durable pending row is intentionally left for recovery.
+        store.record_cleanup_item(&run,seq,&item)?;
+    }
+    if run.state=="running" {run.state=if run.failed>0 || run.skipped>0 || plan.truncated {"partial"} else {"completed"}.into();}
+    run.verification=if run.deleted>0 || run.unknown>0 {"pending"} else {"not_needed"}.into();
+    run.finished_at=Some(chrono::Utc::now().timestamp());
+    run.free_after=crate::scanner::disk_space(root).ok().map(|v|v.1);
+    run.free_observed_at=Some(chrono::Local::now().to_rfc3339());
+    if plan.truncated {run.message=Some("Candidate list was truncated; only previewed objects were processed".into());}
+    store.update_cleanup_run(&run)?;
+    Ok(run)
+}

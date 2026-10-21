@@ -9,3 +9,5 @@ pub mod query;
 pub mod overview;
 pub mod cleanup;
 mod atomic;
+pub mod worker_cleanup;
+pub mod capabilities;

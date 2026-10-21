@@ -72,3 +72,58 @@ fn filename_wildcards_are_bounded_unicode_and_case_insensitive() {
         assert_eq!(filename_matches(name,pattern),expected,"{name} {pattern}");
     }
 }
+
+#[test]
+fn execution_only_deletes_previewed_ordinary_objects_and_is_idempotent() {
+    let (_temp,store,safety,rule)=fixture();let scope=Path::new(&rule.directory);
+    fs::write(scope.join("old.dmp"),b"sample").unwrap();
+    let plan=preview(&store,&safety,&[rule.id],&||false).unwrap();
+    fs::write(scope.join("new.dmp"),b"appeared after preview").unwrap();
+    let run=execute_plan(&store,&safety,&plan,"one-time-request",None,None,&||false).unwrap();
+    assert_eq!(run.deleted,1);assert_eq!(run.state,"completed");assert_eq!(run.verification,"pending");
+    assert!(!scope.join("old.dmp").exists());assert!(scope.join("new.dmp").exists());
+    let retry=execute_plan(&store,&safety,&plan,"one-time-request",None,None,&||panic!("must not execute on retry")).unwrap();
+    assert_eq!(retry.run_id,run.run_id);assert_eq!(store.cleanup_runs(None,50,0).unwrap().0,1);
+    assert_eq!(store.cleanup_items(&run.run_id).unwrap()[0].state,"deleted");
+}
+
+#[test]
+fn replaced_files_and_parent_junction_races_do_not_escape_preview() {
+    let (temp,store,safety,rule)=fixture();let scope=Path::new(&rule.directory);
+    fs::write(scope.join("old.dmp"),b"sample").unwrap();
+    let plan=preview(&store,&safety,&[rule.id.clone()],&||false).unwrap();
+    fs::rename(scope.join("old.dmp"),scope.join("renamed.keep")).unwrap();fs::write(scope.join("old.dmp"),b"sample").unwrap();
+    let run=execute_plan(&store,&safety,&plan,"replaced",None,None,&||false).unwrap();
+    assert_eq!((run.deleted,run.skipped),(0,1));assert!(scope.join("old.dmp").exists());
+    let plan=preview(&store,&safety,&[rule.id],&||false).unwrap();
+    fs::rename(scope,temp.path().join("original")).unwrap();let outside=temp.path().join("outside");fs::create_dir(&outside).unwrap();fs::write(outside.join("old.dmp"),b"keep").unwrap();
+    let output=std::process::Command::new("cmd").args(["/C","mklink","/J"]).arg(scope).arg(&outside).output().unwrap();assert!(output.status.success());
+    // A reparse scope is rejected before a run starts; its target stays untouched.
+    assert!(execute_plan(&store,&safety,&plan,"junction-race",None,None,&||false).is_err());
+    assert_eq!(fs::read(outside.join("old.dmp")).unwrap(),b"keep");
+}
+
+#[test]
+fn shared_files_are_skipped_and_cancel_keeps_completed_deletions() {
+    use std::{fs::OpenOptions,os::windows::fs::OpenOptionsExt,cell::Cell};
+    let (_temp,store,safety,rule)=fixture();let scope=Path::new(&rule.directory);
+    for name in ["one.dmp","two.dmp","busy.dmp"] {fs::write(scope.join(name),b"sample").unwrap();}
+    let plan=preview(&store,&safety,&[rule.id],&||false).unwrap();
+    let held=OpenOptions::new().read(true).share_mode(0).open(scope.join("busy.dmp")).unwrap();
+    let run=execute_plan(&store,&safety,&plan,"shared",None,None,&||false).unwrap();
+    assert_eq!((run.deleted,run.skipped),(2,1));assert_eq!(run.state,"partial");drop(held);
+    for name in ["one.dmp","two.dmp"] {fs::write(scope.join(name),b"sample").unwrap();}
+    let plan=plan_rules(plan.rules,&safety,chrono::Utc::now().timestamp(),&||false).unwrap();
+    let calls=Cell::new(0);
+    let run=execute_plan(&store,&safety,&plan,"cancel",None,None,&||{let n=calls.get();calls.set(n+1);n>=1}).unwrap();
+    assert_eq!(run.deleted,1);assert_eq!(run.state,"cancelled");
+    assert_eq!(fs::read_dir(scope).unwrap().count(),2);
+}
+
+#[test]
+fn incremental_verification_policy_refuses_full_modes() {
+    use volumetrail::{scanner::{ScanPolicy,enforce_scan_policy},model::ScanMode};
+    assert!(enforce_scan_policy(ScanPolicy::RequireIncremental,ScanMode::Full).is_err());
+    assert!(enforce_scan_policy(ScanPolicy::RequireIncremental,ScanMode::Incremental).is_ok());
+    assert!(enforce_scan_policy(ScanPolicy::AllowFull,ScanMode::Full).is_ok());
+}

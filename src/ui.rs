@@ -1,3 +1,4 @@
+mod cleanup;
 mod overview;
 use crate::{config::AppConfig, startup::{self, StartupStatus}, store::{Change, ExtensionBreakdown, FolderBreakdown, FolderGrowth, FolderItem, RankedItem, Report, StorageUsage, Store}, worker};
 use anyhow::Result;
@@ -14,7 +15,7 @@ const CANVAS: Color32 = Color32::from_rgb(246, 248, 247);
 const RULE: Color32 = Color32::from_rgb(219, 227, 224);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum View { Overview, Changes, Folders, History, Settings }
+enum View { Overview, Changes, Folders, History, Settings, Cleanup }
 
 struct PendingClose {
     drive: char,
@@ -24,6 +25,7 @@ struct PendingClose {
 }
 
 pub struct VolumeTrailApp {
+    cleanup_state: cleanup::CleanupState,
     overview_state: overview::OverviewState,
     data: PathBuf,
     store: Store,
@@ -97,6 +99,7 @@ impl VolumeTrailApp {
         let store = Store::open(&worker::store_path(&data))?;
         let config = AppConfig::load(&data)?;
         let mut app = Self {
+            cleanup_state: cleanup::CleanupState::default(),
             overview_state: overview::OverviewState::default(),
             data, store, saved_config: config.clone(), config, drive: 'C', view: View::Overview,
             reports: Vec::new(), scan_count: 0, selected: None,
@@ -441,6 +444,7 @@ impl VolumeTrailApp {
         };
         self.compare_from = Some(from_id);
         if let Some(path) = self.comparison_path.clone() {
+            if ui.button("为此目录创建清理规则…").clicked() {self.new_cleanup_rule(path.clone());}
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&path).strong());
                 if ui.button("返回全部").clicked() {
@@ -586,7 +590,12 @@ impl VolumeTrailApp {
                         ui.label(RichText::new(bytes(item.allocated)).strong());
                         if self.largest_mode == Some(true) { ui.label(format!("{} 文件", item.files)); }
                         if ui.small_button("打开").clicked() { self.open_path(&item.path, self.largest_mode == Some(false)); }
-                        ui.add(egui::Label::new(&item.path).truncate()).on_hover_text(&item.path);
+                        ui.add(egui::Label::new(&item.path).truncate()).on_hover_text(&item.path).context_menu(|ui| {
+                            if ui.button("为所在目录创建清理规则…").clicked() {
+                                let scope=if self.largest_mode==Some(true) {item.path.clone()} else {Path::new(&item.path).parent().map(|p|p.to_string_lossy().into_owned()).unwrap_or_default()};
+                                self.new_cleanup_rule(scope);ui.close();
+                            }
+                        });
                     });
                     ui.separator();
                 }
@@ -602,16 +611,20 @@ impl VolumeTrailApp {
             }
         });
         ui.label(RichText::new(self.folder_path()).color(MUTED));
+        if ui.button("为此目录创建清理规则…").clicked() {self.new_cleanup_rule(self.folder_path());}
         ui.separator();
         let items = self.folders.clone();
         egui::ScrollArea::vertical().show_rows(ui, 30.0, items.len(), |ui, range| {
             for item in items[range].iter().cloned() {
                 ui.horizontal(|ui| {
                     let label = if item.is_dir { format!("> {}", item.name) } else { item.name.clone() };
-                    if ui.selectable_label(false, label).clicked() && item.is_dir {
-                        self.breadcrumbs.push((item.id, item.name.clone()));
-                        self.load_folder();
-                    }
+                    let response=ui.selectable_label(false,label);
+                    let selected=response.clicked();
+                    let scope=if item.is_dir {format!("{}{}",self.folder_path(),item.name)} else {self.folder_path()};
+                    response.context_menu(|ui| {
+                        if ui.button("为此目录创建清理规则…").clicked() {self.new_cleanup_rule(scope);ui.close();}
+                    });
+                    if selected && item.is_dir {self.breadcrumbs.push((item.id,item.name.clone()));self.load_folder();}
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let path = format!("{}{}", self.folder_path(), item.name);
                         if ui.small_button("定位").clicked() { self.open_path(&path, !item.is_dir); }
@@ -727,6 +740,9 @@ impl VolumeTrailApp {
     }
 
     fn settings_view(&mut self, ui: &mut egui::Ui) {
+        if ui.button("文件清理规则").clicked() {self.view=View::Cleanup;}
+        ui.label("管理指定目录的直接删除规则；与扫描历史整理分开。");
+        ui.separator();
         ui.heading("设置");
         ui.add_space(12.0);
         ui.strong("自动扫描磁盘");
@@ -831,6 +847,7 @@ impl VolumeTrailApp {
 
 impl eframe::App for VolumeTrailApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_cleanup();
         self.poll_history_job();
         self.poll_comparison();
         self.poll_largest();
@@ -887,6 +904,7 @@ impl eframe::App for VolumeTrailApp {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(CANVAS).inner_margin(egui::Margin::symmetric(24, 20))).show(ctx, |ui| {
             self.toolbar(ui);
             match self.view {
+                View::Cleanup => {egui::ScrollArea::vertical().show(ui,|ui|self.cleanup_view(ui));}
                 View::Overview => { egui::ScrollArea::vertical().show(ui, |ui| self.overview(ui)); }
                 View::Changes => self.changes_view(ui),
                 View::Folders => self.folders_view(ui),

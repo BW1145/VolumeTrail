@@ -59,12 +59,12 @@ fn lock_path(data: &Path, letter: char) -> PathBuf {
     data.join(format!("scan-{}.lock", letter.to_ascii_uppercase()))
 }
 
-fn scan_lock(data: &Path, letter: char) -> Result<File> {
+pub(crate) fn scan_lock(data: &Path, letter: char) -> Result<File> {
     OpenOptions::new().read(true).write(true).create(true).share_mode(0)
         .open(lock_path(data, letter)).context("Another scan is running")
 }
 
-fn global_scan_lock(data: &Path) -> Result<File> {
+pub(crate) fn global_scan_lock(data: &Path) -> Result<File> {
     OpenOptions::new().read(true).write(true).create(true).share_mode(0)
         .open(data.join("scan-all.lock")).context("Another disk is already being scanned")
 }
@@ -79,12 +79,18 @@ pub fn is_any_running(data: &Path) -> bool {
     })
 }
 
+/// Inspect existing locks without creating files; safe for machine read-only commands.
+pub fn operation_active_read_only(data:&Path)->bool {
+    std::iter::once(data.join("scan-all.lock")).chain(('A'..='Z').map(|letter|lock_path(data,letter)))
+        .any(|path|path.exists() && OpenOptions::new().read(true).share_mode(0).open(path).is_err())
+}
+
 pub fn read_status(data: &Path, letter: char) -> Option<ScanStatus> {
     fs::read(status_path(data, letter)).ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
 }
 
-fn write_status(data: &Path, letter: char, status: &ScanStatus) -> Result<()> {
+pub(crate) fn write_status(data: &Path, letter: char, status: &ScanStatus) -> Result<()> {
     fs::write(status_path(data, letter), serde_json::to_vec(status)?)?;
     Ok(())
 }
@@ -157,7 +163,7 @@ pub fn run_auto() -> Result<()> {
             })?;
             continue;
         }
-        if let Err(error) = run_scan_locked(letter, &data, budget) {
+        if let Err(error) = run_scan_locked(letter, &data, budget, true) {
             failures.push(format!("{letter}: {error:#}"));
         }
     }
@@ -167,10 +173,10 @@ pub fn run_auto() -> Result<()> {
 
 fn run_scan_configured(letter: char, data: &Path, budget: u64) -> Result<()> {
     let _global_lock = global_scan_lock(data)?;
-    run_scan_locked(letter, data, budget)
+    run_scan_locked(letter, data, budget, false)
 }
 
-fn run_scan_locked(letter: char, data: &Path, budget: u64) -> Result<()> {
+fn run_scan_locked(letter: char, data: &Path, budget: u64, automatic: bool) -> Result<()> {
     let started = Instant::now();
     let cpu_started = process_cpu_ms();
     ensure!(letter.is_ascii_alphabetic(), "Invalid drive letter");
@@ -180,9 +186,9 @@ fn run_scan_locked(letter: char, data: &Path, budget: u64) -> Result<()> {
         Err(error) => return Err(error).context("Enter background scan mode"),
     }
     let letter = letter.to_ascii_uppercase();
-    let _lock = scan_lock(data, letter)?;
     let stop = stop_path(data, letter);
     if stop.exists() { fs::remove_file(&stop)?; }
+    let _lock = scan_lock(data, letter)?;
     let root = format!("{letter}:\\");
     let mut status = ScanStatus { root: root.clone(), phase: "开始扫描".into(), ..Default::default() };
     write_status(data, letter, &status)?;
@@ -192,6 +198,7 @@ fn run_scan_locked(letter: char, data: &Path, budget: u64) -> Result<()> {
     let result = (|| {
         let mut store = Store::open(&store_path(data))?;
         store.set_cancel_path(stop.clone());
+        store.recover_cleanup_runs()?;
         let scan_started = Instant::now();
         let mut commit_started = None;
         let report = scan_volume(&root, &mut store, &|| stop.exists(), &mut |progress: ScanProgress| {
@@ -204,16 +211,29 @@ fn run_scan_locked(letter: char, data: &Path, budget: u64) -> Result<()> {
                 status.read_ms = Some(scan_started.elapsed().as_millis() as u64);
                 commit_started = Some(Instant::now());
             }
-            println!("{} {}: {} records", chrono::Local::now().format("%H:%M:%S"), progress.phase, progress.processed);
+            eprintln!("{} {}: {} records", chrono::Local::now().format("%H:%M:%S"), progress.phase, progress.processed);
             status.phase = progress.phase;
             status.processed = progress.processed;
             let _ = write_status(data, letter, &status);
         }, &mut counters)?;
         status.commit_ms = commit_started.map(|instant: Instant| instant.elapsed().as_millis() as u64);
         let warnings = store.report_warnings(report)?;
+        let volume = store.checkpoint(&root)?.unwrap().volume_id;
+        store.reconcile_cleanup_after_scan(&volume,report)?;
+        let mut final_report = report;
+        if automatic {
+            status.phase = "文件清理规则".into();
+            write_status(data,letter,&status)?;
+            match crate::worker_cleanup::automatic(data,&mut store,&root,report,&mut counters) {
+                Ok(Some(run)) => { final_report = run.post_scan.unwrap_or(report); if let Some(message)=run.message {append_warning(&mut status.warning,message);} }
+                Ok(None) => {}
+                Err(error) => append_warning(&mut status.warning,format!("Cleanup stopped: {error:#}")),
+            }
+        }
+        store.prune_cleanup(chrono::Utc::now().timestamp())?;
         if !warnings.is_empty() { status.warning = Some(warnings.join("；")); }
         status.phase = "整理历史".into();
-        println!("{} 整理历史", chrono::Local::now().format("%H:%M:%S"));
+        eprintln!("{} 整理历史", chrono::Local::now().format("%H:%M:%S"));
         write_status(data, letter, &status)?;
         let maintenance_started = Instant::now();
         match store.prune(budget).and_then(|_| store.history_bytes()) {
@@ -226,7 +246,7 @@ fn run_scan_locked(letter: char, data: &Path, budget: u64) -> Result<()> {
             _ => {}
         }
         status.maintenance_ms = Some(maintenance_started.elapsed().as_millis() as u64);
-        Ok((report, store))
+        Ok((final_report, store))
     })();
     if let Some(start) = pause_started.take() { paused_ms += start.elapsed().as_millis() as u64; }
     status.finished = true;
@@ -254,7 +274,7 @@ fn run_scan_locked(letter: char, data: &Path, budget: u64) -> Result<()> {
         Err(error) => { status.phase = "失败".into(); status.error = Some(format!("{error:#}")); }
     }
     write_status(data, letter, &status)?;
-    println!("{} {} in {:.1} seconds", chrono::Local::now().format("%H:%M:%S"), status.phase, started.elapsed().as_secs_f64());
+    eprintln!("{} {} in {:.1} seconds", chrono::Local::now().format("%H:%M:%S"), status.phase, started.elapsed().as_secs_f64());
     result.map(|_| ())
 }
 

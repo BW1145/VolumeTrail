@@ -10,6 +10,7 @@ pub struct Store {
     db: Connection,
     path: PathBuf,
     staging: bool,
+    verification_context: Option<(Option<i64>,String)>,
     cancel_path: Option<PathBuf>,
     pub commit_timings: CommitTimings,
 }
@@ -105,7 +106,7 @@ impl Store {
         db.busy_timeout(Duration::from_secs(3))?;
         ensure!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? >= 2,
             "History database needs a one-time upgrade; open VolumeTrail first");
-        Ok(Self { db, path: path.to_path_buf(), staging: false, cancel_path: None, commit_timings: CommitTimings::default() })
+        Ok(Self { db, path: path.to_path_buf(), staging: false, verification_context: None, cancel_path: None, commit_timings: CommitTimings::default() })
     }
 
     pub fn data_version(&self) -> Result<i64> {
@@ -242,7 +243,7 @@ impl Store {
         }
         Self::migrate_operations(&db)?;
         Self::migrate_cleanup(&db)?;
-        Ok(Self { db, path: path.to_path_buf(), staging: false, cancel_path: None, commit_timings: CommitTimings::default() })
+        Ok(Self { db, path: path.to_path_buf(), staging: false, verification_context: None, cancel_path: None, commit_timings: CommitTimings::default() })
     }
 
     pub fn set_cancel_path(&mut self, path: PathBuf) { self.cancel_path = Some(path); }
@@ -433,6 +434,13 @@ impl Store {
         self.db.execute("INSERT INTO scans(id,root,volume,finished,mode,total,free,logical,allocated,file_count,warnings,sampled,details,aggregate) VALUES(?,?,?,?,?,?,?,0,0,0,?,?,1,2)",
             params![scan, root, cp.volume_id, outcome.sampled_at, if outcome.mode == ScanMode::Full { "full" } else { "incremental" },
                 outcome.total as i64, outcome.free as i64, serde_json::to_string(&outcome.warnings)?, outcome.sampled_at])?;
+        if let Some((pre,run)) = &self.verification_context {
+            if let Some(pre)=pre {
+                self.db.execute("UPDATE scans SET operation_pre=?,verification='verified' WHERE id=?",params![pre,scan])?;
+                self.db.execute("UPDATE scans SET verification='verified' WHERE id=?",[pre])?;
+            }
+            self.db.execute("UPDATE cleanup_runs SET payload=json_set(payload,'$.post_scan',?,'$.verification','verified') WHERE id=?",params![scan,run])?;
+        }
         let old_total: (i64, i64, i64) = self.db.query_row(
             "SELECT logical,allocated,files FROM volume_totals WHERE volume=?", [&cp.volume_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?.unwrap_or_default();

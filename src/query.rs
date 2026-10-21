@@ -61,7 +61,9 @@ pub fn execute(args: Vec<String>) -> Result<Value> {
     let volume = &checkpoint.volume_id;
     let indexed_at = store.index_state(volume)?.map(|(_, _, _, at)| at);
     let reports: Vec<_> = store.reports()?.into_iter().filter(|report| report.volume == *volume).collect();
-    let default_interval = store.default_interval(&reports)?;
+    let current_point_present=reports.first().zip(indexed_at.as_ref()).is_some_and(|(r,at)|r.sampled==*at);
+    let default_interval = if current_point_present {store.default_interval(&reports)?} else {None};
+    if command=="growth" && from.is_none() && to.is_none() {ensure!(default_interval.is_some(),"No complete operation comparison baseline; choose explicit scans or scan again");}
     let mut result = match command.as_str() {
         "summary" => {
             let items = reports.iter().skip(offset as usize).take(limit as usize).map(|report| json!({
