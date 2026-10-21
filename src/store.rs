@@ -3,6 +3,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use std::{collections::{HashMap, HashSet}, fs, path::{Path, PathBuf}, time::{Duration, Instant}};
+mod operations;
 
 pub struct Store {
     db: Connection,
@@ -21,7 +22,7 @@ pub struct Change {
     pub kind: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Report {
     pub id: i64,
     pub root: String,
@@ -59,7 +60,7 @@ pub struct RankedItem {
     pub modified: i64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct FolderGrowth {
     pub path: String,
     pub allocated_delta: i128,
@@ -238,6 +239,7 @@ impl Store {
                 CREATE INDEX nodes_directories ON nodes(volume,id,parent,name) WHERE is_dir=1;
                 PRAGMA user_version=7; COMMIT;")?;
         }
+        Self::migrate_operations(&db)?;
         Ok(Self { db, path: path.to_path_buf(), staging: false, cancel_path: None, commit_timings: CommitTimings::default() })
     }
 

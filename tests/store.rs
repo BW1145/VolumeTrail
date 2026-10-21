@@ -754,3 +754,24 @@ fn folder_queries_reject_malformed_absolute_drive_paths() {
         assert!(store.changes_between_path("volume-A", 0, 1, path, 50, 0).is_err(), "changes: {path:?}");
     }
 }
+
+#[test]
+fn overview_groups_verification_and_preserves_real_observations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&dir.path().join("history.db")).unwrap();
+    let a = store.publish("C:\\", &[file(30,"a.bin",10)], &outcome(ScanMode::Full,10)).unwrap();
+    let b = store.publish("C:\\", &[file(30,"a.bin",30)], &outcome(ScanMode::Incremental,20)).unwrap();
+    let c = store.publish("C:\\", &[Mutation::Delete(30)], &outcome(ScanMode::Incremental,30)).unwrap();
+    store.mark_verification(b,"verified",Some(c)).unwrap();
+    let overview = volumetrail::overview::load(&store,"C:\\").unwrap();
+    assert_eq!((overview.interval.as_ref().unwrap().from,overview.interval.as_ref().unwrap().to),(a,b));
+    assert_eq!(overview.latest.unwrap().id,c);
+    assert_eq!(overview.trend.len(),3);
+    assert_eq!(overview.growth.iter().map(|i|i.allocated_delta).sum::<i128>(),20);
+    store.delete_scans(&[b]).unwrap();
+    let overview = volumetrail::overview::load(&store,"C:\\").unwrap();
+    assert!(overview.interval.is_none()); // never compare a verification point as a new operation
+    assert_eq!(overview.verification,"baseline_missing");
+    drop(store);
+    Store::open(&dir.path().join("history.db")).unwrap(); // migration is idempotent
+}

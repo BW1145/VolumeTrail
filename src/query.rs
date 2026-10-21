@@ -3,7 +3,15 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
 pub fn run(args: Vec<String>) -> Result<()> {
-    let (command, rest) = args.split_first().context("Use query summary|growth|folder|largest")?;
+    let machine = args.iter().any(|a| a == "--json");
+    match execute(args) {
+        Ok(result) => { if machine { println!("{}", serde_json::to_string(&result)?); } else { print_text(&result); } Ok(()) }
+        Err(error) => { if machine { println!("{}", json!({"schema_version":1,"ok":false,"status":"failed","error":{"code":"query_failed","message":format!("{error:#}")},"data":null})); } Err(error) }
+    }
+}
+
+pub fn execute(args: Vec<String>) -> Result<Value> {
+    let (command, rest) = args.split_first().context("Use query overview|summary|growth|folder|largest")?;
     let mut drive = 'C';
     let mut limit = 50u64;
     let mut offset = 0u64;
@@ -13,10 +21,10 @@ pub fn run(args: Vec<String>) -> Result<()> {
     let mut depth_explicit = false;
     let mut path = None;
     let mut kind = "folders".to_owned();
-    let mut json_output = false;
+
     let mut iter = rest.iter();
     while let Some(flag) = iter.next() {
-        if flag == "--json" { json_output = true; continue; }
+        if flag == "--json" { continue; }
         let value = iter.next().with_context(|| format!("Missing value for {flag}"))?;
         match flag.as_str() {
             "--drive" => {
@@ -34,6 +42,8 @@ pub fn run(args: Vec<String>) -> Result<()> {
         }
     }
     ensure!((1..=5000).contains(&limit) && (1..=32).contains(&depth), "Limit must be 1-5000 and depth 1-32");
+    ensure!(offset <= i64::MAX as u64, "Offset is too large");
+    ensure!(["overview","summary","growth","folder","largest"].contains(&command.as_str()), "Unknown query command");
     let root = format!("{drive}:\\");
     if command == "growth" && !depth_explicit {
         if let Some(folder) = path.as_deref() {
@@ -42,11 +52,17 @@ pub fn run(args: Vec<String>) -> Result<()> {
     }
     let data = worker::existing_data_dir()?;
     let store = Store::open_read_only(&worker::store_path(&data))?;
+    if command == "overview" {
+        let mut result = serde_json::to_value(crate::overview::load(&store,&root)?)?;
+        result["command"] = json!("overview"); result["schema_version"] = json!(1); result["ok"] = json!(true); result["status"] = json!("completed");
+        return Ok(result);
+    }
     let checkpoint = store.checkpoint(&root)?.with_context(|| format!("No scan for {root}"))?;
     let volume = &checkpoint.volume_id;
     let indexed_at = store.index_state(volume)?.map(|(_, _, _, at)| at);
     let reports: Vec<_> = store.reports()?.into_iter().filter(|report| report.volume == *volume).collect();
-    let result = match command.as_str() {
+    let default_interval = store.default_interval(&reports)?;
+    let mut result = match command.as_str() {
         "summary" => {
             let items = reports.iter().skip(offset as usize).take(limit as usize).map(|report| json!({
                 "id": report.id, "drive": report.root, "volume": report.volume,
@@ -60,8 +76,8 @@ pub fn run(args: Vec<String>) -> Result<()> {
             json!({"command":"summary","drive":root,"total":reports.len(),"offset":offset,"limit":limit,"items":items})
         }
         "growth" => {
-            let end = to.or_else(|| reports.first().map(|report| report.id)).context("No scan points")?;
-            let start = from.or_else(|| reports.iter().find(|report| report.id < end).map(|report| report.id))
+            let end = to.or_else(|| if from.is_none() { default_interval.map(|i| i.1) } else { None }).or_else(|| reports.first().map(|report| report.id)).context("No scan points")?;
+            let start = from.or_else(|| if to.is_none() { default_interval.map(|i| i.0) } else { None }).or_else(|| reports.iter().find(|report| report.id < end).map(|report| report.id))
                 .context("At least two scan points are needed")?;
             ensure!(start < end && reports.iter().any(|r| r.id == start) && reports.iter().any(|r| r.id == end),
                 "Choose two existing scans on the same volume, earliest first");
@@ -96,31 +112,35 @@ pub fn run(args: Vec<String>) -> Result<()> {
                 "allocated_bytes":item.allocated,"files":item.files,
             })).collect::<Vec<_>>();
             let comparison = if from.is_some() || to.is_some() {
-                let end = to.or_else(|| reports.first().map(|r| r.id)).context("No scan points")?;
-                let start = from.or_else(|| reports.iter().find(|r| r.id < end).map(|r| r.id))
+                let end = to.or_else(|| if from.is_none() { default_interval.map(|i| i.1) } else { None }).or_else(|| reports.first().map(|r| r.id)).context("No scan points")?;
+                let start = from.or_else(|| if to.is_none() { default_interval.map(|i| i.0) } else { None }).or_else(|| reports.iter().find(|r| r.id < end).map(|r| r.id))
                     .context("At least two scan points are needed")?;
                 ensure!(start < end && reports.iter().any(|r| r.id == start) && reports.iter().any(|r| r.id == end),
                     "Choose two existing scans on the same volume, earliest first");
                 let breakdown = store.folder_breakdown(volume, start, end, &folder_path)?;
                 let mut child_growth = breakdown.children;
                 child_growth.sort_by(|a, b| b.allocated_delta.abs().cmp(&a.allocated_delta.abs()));
-                let children = child_growth.into_iter()
+                let children_total = child_growth.len();
+                let children = child_growth.into_iter().skip(offset as usize)
                     .take(limit as usize).map(|item| json!({"path":item.path,
                         "allocated_delta_bytes":item.allocated_delta,"moved_delta_bytes":item.moved_delta,
                         "events":item.changes})).collect::<Vec<_>>();
                 let types = store.extensions_between_path(volume, start, end, &folder_path)?;
+                let extensions_total = types.items.len();
                 let extensions = types.items.into_iter().take(10).map(|(extension, delta, events)| json!({
                         "extension":extension,"allocated_delta_bytes":delta,"events":events})).collect::<Vec<_>>();
                 Some(json!({"from":start,"to":end,"coverage":store.coverage(volume,start,end)?,
                     "allocated_delta_bytes":breakdown.allocated_delta,
                     "direct_delta_bytes":breakdown.direct_delta,"moved_delta_bytes":breakdown.moved_delta,
-                    "children":children,"extensions":extensions,
+                    "children":children,"children_total":children_total,"children_offset":offset,"children_has_more":offset.saturating_add(limit) < children_total as u64,
+                    "extensions":extensions,"extensions_total":extensions_total,"extensions_truncated":extensions_total>10,
                     "extension_intervals":types.intervals,"complete_extension_intervals":types.complete_intervals}))
             } else { None };
             json!({"command":"folder","drive":root,"volume":volume,"path":folder_path,
                 "indexed_at":indexed_at,"current_index_present":id.is_some(),
                 "logical_bytes":stats.map(|value| value.0),
                 "allocated_bytes":stats.map(|value| value.1),"files":stats.map(|value| value.2),"comparison":comparison,
+                "total":id.map(|id| store.children_count(volume,id)).transpose()?.unwrap_or(0),
                 "offset":offset,"limit":limit,"items":items})
         }
         "largest" => {
@@ -129,13 +149,18 @@ pub fn run(args: Vec<String>) -> Result<()> {
                 .into_iter().map(|item| json!({"path":item.path,"allocated_bytes":item.allocated,
                     "logical_bytes":item.logical,"files":item.files,"modified":item.modified})).collect::<Vec<_>>();
             json!({"command":"largest","drive":root,"volume":volume,"kind":kind,
-                "indexed_at":indexed_at,"offset":offset,"limit":limit,"items":items})
+                "indexed_at":indexed_at,"total":store.largest_count(volume,checkpoint.root_id,kind == "folders")?,"offset":offset,"limit":limit,"items":items})
         }
-        _ => bail!("Use query summary|growth|folder|largest"),
+        _ => bail!("Use query overview|summary|growth|folder|largest"),
     };
-    if json_output { println!("{}", serde_json::to_string_pretty(&result)?); }
-    else { print_text(&result); }
-    Ok(())
+    result["schema_version"] = json!(1);
+    result["ok"] = json!(true);
+    result["status"] = json!("completed");
+    result["observed_at"] = json!(indexed_at);
+    if let Some(from) = result["from"].as_i64() { result["from_observed_at"] = json!(reports.iter().find(|r| r.id==from).map(|r| &r.sampled)); }
+    if let Some(to) = result["to"].as_i64() { result["to_observed_at"] = json!(reports.iter().find(|r| r.id==to).map(|r| &r.sampled)); }
+    if let Some(total) = result["total"].as_u64() { result["has_more"] = json!(offset.saturating_add(limit)<total); }
+    Ok(result)
 }
 
 fn print_text(value: &Value) {

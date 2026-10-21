@@ -105,3 +105,7 @@ CLI 真调用验证中文空格路径、空结果、分页、失败 JSON、修�
 ## 实施记录
 
 - 初始化：确认仓库远端与干净 main；无项目 AGENTS.md；建立独立工作树，未改主检出。
+
+- 阶段一：共享 overview 服务、异步概览样板与中间省略路径；扫描操作关联元数据迁移；
+  CLI overview 与分页 total、历史 children offset/截断说明。44 项 Windows 回归通过，含核验分组和删基线。
+  已合入 origin/main 的 ae8a1b3（GPL）。真实 UI 视觉验证仍在阶段四，清理尚未实现。
