@@ -16,6 +16,10 @@ pub(super) struct CleanupState {
     technical_message:Option<String>,
     rx:Option<Receiver<Result<Reply,String>>>,
     cancel_request:Option<String>,
+    #[cfg(feature="ui-capture")]
+    capture_section:Option<&'static str>,
+    #[cfg(feature="ui-capture")]
+    capture_expand:bool,
 }
 struct Reply {rules:Vec<CleanupRule>,runs:Vec<Run>,saved:Option<CleanupRule>,plan:Option<Plan>,result:Option<(Run,Vec<RunItem>)>,directory:Option<String>}
 enum Job {PickDirectory,Load,Save(CleanupRule),Preview(String),Enable(String,u64,String),Pause(String,u64),Delete(String,u64),Execute(String,String),Result(String)}
@@ -115,7 +119,7 @@ impl VolumeTrailApp {
                 ui.colored_label(if rule.enabled {GREEN} else {MUTED},if rule.enabled {"已启用"} else {"已暂停"});
                 if rule.enabled && ui.add_enabled(!busy,egui::Button::new("暂停")).clicked() {job=Some(Job::Pause(rule.id.clone(),rule.revision));}
             });
-            ui.add(egui::Label::new(&rule.directory).truncate()).on_hover_text(&rule.directory);
+            path_label(ui,&rule.directory);
         }
         ui.separator();
         if let Some(rule)=&mut state.editor {
@@ -127,9 +131,9 @@ impl VolumeTrailApp {
                         if ui.button("选择目录…").clicked() {job=Some(Job::PickDirectory);}
                     });ui.end_row();
                     ui.label("文件名匹配");if ui.text_edit_singleline(&mut state.patterns).changed() {rule.patterns=state.patterns.split(';').map(str::trim).filter(|p|!p.is_empty()).map(str::to_owned).collect();}ui.end_row();
-                    ui.label("修改时间");ui.horizontal_wrapped(|ui| {
-                        ui.label("仅清理至少");ui.add(egui::DragValue::new(&mut rule.min_age_days).range(0..=36500));ui.label("天未修改的文件");
-                        if rule.min_age_days==0 {ui.label("0 天：不按时间保留");}
+                    ui.label("修改时间");ui.vertical(|ui| {
+                        ui.horizontal(|ui| {ui.label("至少");ui.add(egui::DragValue::new(&mut rule.min_age_days).range(0..=36500));ui.label("天未修改");});
+                        if rule.min_age_days==0 {ui.label(RichText::new("0 天：不按时间保留").small().color(MUTED));}
                     });ui.end_row();
                     ui.label("子目录");ui.checkbox(&mut rule.recursive,"包含子目录（默认关闭）");ui.end_row();
                 });
@@ -145,12 +149,20 @@ impl VolumeTrailApp {
             });
         }
         if let Some(plan)=&state.plan {
-            ui.add_space(10.0);ui.strong("本次预览");
+            ui.add_space(10.0);let heading=ui.strong("本次预览");
+            #[cfg(feature="ui-capture")]
+            if state.capture_section==Some("preview") {heading.scroll_to_me(Some(egui::Align::TOP));}
+            #[cfg(not(feature="ui-capture"))]
+            let _=heading;
             ui.label(format!("{} 个候选 · 占用估算 {} · 跳过 {} 项",plan.candidate_count,bytes(plan.allocated_bytes_estimate),plan.skipped_count));
             if plan.truncated {ui.colored_label(AMBER,"候选已截断；本次只处理显示计划中的对象。自动启用需要缩小范围后重新预览。");}
-            ui.collapsing("查看候选文件与跳过原因",|ui| {
+            #[cfg(not(feature="ui-capture"))]
+            let expanded=None;
+            #[cfg(feature="ui-capture")]
+            let expanded=state.capture_expand.then_some(true);
+            egui::CollapsingHeader::new("查看候选文件与跳过原因").id_salt("cleanup_preview_files").open(expanded).show(ui,|ui| {
                 egui::ScrollArea::vertical().id_salt("cleanup_candidates").max_height(180.0).show(ui,|ui| {
-                    for candidate in plan.candidates.iter().take(200) {ui.horizontal(|ui|{ui.label(bytes(candidate.snapshot.allocated_bytes));ui.add(egui::Label::new(&candidate.path).truncate()).on_hover_text(&candidate.path);});}
+                    for candidate in plan.candidates.iter().take(200) {ui.horizontal(|ui|{ui.label(bytes(candidate.snapshot.allocated_bytes));path_label(ui,&candidate.path);});}
                     if plan.candidates.len()>200 {ui.label("界面显示前 200 项；CLI JSON 可读取计划完整候选。");}
                     for (reason,count) in &plan.skip_reasons {ui.label(format!("{}：{count}",skip_reason(reason)));}
                 });
@@ -162,7 +174,7 @@ impl VolumeTrailApp {
             ui.add_enabled(!busy,egui::Checkbox::new(&mut state.acknowledge,"我确认以上目录和匹配范围，理解直接删除不可撤销"));
             ui.add_enabled_ui(!busy && !expired && state.acknowledge,|ui| {
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("立即执行本次预览").clicked() {job=Some(Job::Execute(plan.plan_id.clone(),format!("gui-{}",service::new_id())));}
+                    if ui.button("删除本次匹配文件").clicked() {job=Some(Job::Execute(plan.plan_id.clone(),format!("gui-{}",service::new_id())));}
                     if !plan.truncated && plan.rules.len()==1 && ui.button("启用此规则：登录扫描后自动清理").clicked() {
                         let rule=&plan.rules[0];job=Some(Job::Enable(rule.id.clone(),rule.revision,plan.plan_id.clone()));
                     }
@@ -171,21 +183,29 @@ impl VolumeTrailApp {
             if expired {ui.colored_label(AMBER,"预览已过期，请重新预览。");}
         }
         if !state.runs.is_empty() {
-            ui.add_space(14.0);ui.separator();ui.strong("最近清理结果");
+            ui.add_space(14.0);ui.separator();let heading=ui.strong("最近清理结果");
+            #[cfg(feature="ui-capture")]
+            if state.capture_section==Some("result") {heading.scroll_to_me(Some(egui::Align::TOP));}
+            #[cfg(not(feature="ui-capture"))]
+            let _=heading;
             for run in &state.runs {
                 if ui.add_enabled(!busy,egui::Button::new(format!("{} · {} · 删除 {} · 跳过 {} · 失败 {}",run_time(run.started_at),run_state(&run.state),run.deleted,run.skipped,run.failed))).clicked() {job=Some(Job::Result(run.run_id.clone()));}
-                ui.label(RichText::new(verification_state(&run.verification)).color(if run.verification=="verified" || run.verification=="not_needed" {MUTED} else {AMBER}));
+                ui.label(RichText::new(format!("已删除占用估算 {} · {}",bytes(run.allocated_bytes_estimate),verification_state(&run.verification))).color(if run.verification=="verified" || run.verification=="not_needed" {MUTED} else {AMBER}));
                 if run.unknown>0 {ui.colored_label(AMBER,format!("{} 项处理结果尚未确定",run.unknown));}
             }
         }
         if let Some((run,items))=&state.result {
-            ui.collapsing("执行明细",|ui| {
+            #[cfg(not(feature="ui-capture"))]
+            let expanded=None;
+            #[cfg(feature="ui-capture")]
+            let expanded=state.capture_expand.then_some(true);
+            egui::CollapsingHeader::new("执行明细").id_salt("cleanup_result_items").open(expanded).show(ui,|ui| {
                 ui.label(format!("{} · {}",run_time(run.started_at),verification_state(&run.verification)));
                 ui.label(format!("已删除占用估算 {}",bytes(run.allocated_bytes_estimate)));
                 if let (Some(a),Some(b))=(run.free_before,run.free_after) {ui.label(format!("磁盘实际可用空间变化 {}（含其他程序并发变化）",signed_bytes(i128::from(b)-i128::from(a))));}
                 if run.message.is_some() {ui.colored_label(AMBER,if run.state=="interrupted" {"执行意外中断，未确定的项目不会重试删除。"} else if run.state=="cancelled" {"已停止后续文件，之前完成的删除已保留。"} else {"清理记录已保存；文件统计需等下次扫描更新。"});}
                 if run.details_trimmed {ui.label("逐项明细已裁剪，汇总仍保留。");}
-                for item in items {ui.label(format!("{} · {}",item_state(&item.state),item.path));if let Some(reason)=&item.reason {ui.label(skip_reason(reason));}}
+                for item in items {ui.horizontal(|ui| {ui.label(item_state(&item.state));path_label(ui,&item.path);});if let Some(reason)=&item.reason {ui.label(skip_reason(reason));}}
                 ui.collapsing("执行技术详情",|ui| {ui.label(format!("执行 {} · 请求 {} · 计划 {}",run.run_id,run.request_id,run.plan_id));if let Some(message)=&run.message {ui.label(message);}for item in items {if let Some(reason)=&item.reason {ui.label(format!("{}: {reason}",item.path));}}});
             });
         }
@@ -193,6 +213,20 @@ impl VolumeTrailApp {
         if let Some(job)=job {self.cleanup_job(job);}
         if busy {ui.ctx().request_repaint_after(Duration::from_millis(50));}
     }
+}
+
+fn fitted_path(ui:&egui::Ui,path:&str)->String {
+    let font=egui::TextStyle::Body.resolve(ui.style());
+    let width=ui.available_width().max(1.0);
+    let mut limit=(width/6.0).max(3.0) as usize;
+    loop {
+        let text=super::overview::middle_path(path,limit);
+        if limit<=3 || ui.painter().layout_no_wrap(text.clone(),font.clone(),INK).size().x<=width {return text;}
+        limit-=1;
+    }
+}
+fn path_label(ui:&mut egui::Ui,path:&str)->egui::Response {
+    ui.add(egui::Label::new(fitted_path(ui,path)).truncate()).on_hover_text(path)
 }
 
 pub(super) fn run_state(value:&str)->&str {match value {"completed"=>"完成","partial"=>"部分完成","cancelled"=>"已取消","interrupted"=>"异常中断","running"=>"执行中",_=>"状态未知"}}
@@ -215,6 +249,7 @@ fn skip_reason(reason:&str)->&str {
     else if reason.contains("0x80070020") || reason.contains("0x80070021") {"文件正在使用，已跳过"}
     else if reason.contains("directory_unavailable") {"目录暂时无法访问，已跳过"}
     else if reason.contains("non_unicode") {"文件名无法显示，已跳过"}
+    else if reason.contains("Process interrupted") {"处理中断，结果未确认；不会重放删除"}
     else {"无法安全处理，已跳过；原始原因见技术详情"}
 }
 fn friendly_error(error:&str)->&str {
@@ -242,13 +277,28 @@ pub(super) fn prepare_capture(app:&mut VolumeTrailApp,scope:&Path,scenario:&str)
     let rule=service::save_rule(&app.store,&safety,CleanupRule {name:"样本转储文件".into(),directory:scope.to_str().unwrap().into(),patterns:vec!["*.dmp".into()],..Default::default()})?;
     let plan=service::preview(&app.store,&safety,&[rule.id.clone()],&||false)?;
     let state=&mut app.cleanup_state;state.loaded=true;state.rules=vec![rule.clone()];state.patterns="*.dmp".into();state.editor=Some(rule.clone());state.original=Some(rule);
-    if scenario=="preview" {state.plan=Some(plan);}
-    else if scenario=="result" {
+    state.capture_expand=matches!(scenario,"preview-expanded"|"preview-confirmed"|"long-path"|"result-details"|"partial"|"interrupted");
+    if scenario.starts_with("preview") || scenario=="long-path" {
+        state.plan=Some(plan);state.acknowledge=matches!(scenario,"preview-confirmed"|"preview-bottom");
+        if matches!(scenario,"preview-expanded"|"preview-confirmed"|"preview-bottom") {state.capture_section=Some("preview");}
+    }
+    else if matches!(scenario,"result"|"result-details"|"partial"|"interrupted") {
         let run=crate::worker_cleanup::execute(&app.data,&plan.plan_id,"visual-fixture")?;
         state.runs=vec![run.clone()];state.result=Some((run.clone(),app.store.cleanup_items(&run.run_id)?));
+        if scenario!="result" {state.capture_section=Some("result");}
+        // Synthetic failure presentation only; these scenarios do not inject OS failures.
+        if matches!(scenario,"partial"|"interrupted") {
+            let (run,items)=state.result.as_mut().unwrap();run.deleted=1;run.allocated_bytes_estimate=8192;
+            run.state=if scenario=="partial" {"partial"} else {"interrupted"}.into();run.verification="unverified".into();
+            if scenario=="partial" {run.failed=1;items[1].state="failed".into();items[1].reason=Some("0x80070005".into());}
+            else {run.unknown=1;run.message=Some("Synthetic interruption presentation".into());items[1].state="unknown".into();items[1].reason=Some("Process interrupted; do not replay".into());}
+            state.runs=vec![run.clone()];
+        }
     } else if scenario=="error" {state.message=Some("样本错误：文件正在被其他程序占用，已跳过。请检查预览范围后重试。".into());}
     // Presentation-only fixture aliases keep review screenshots free of host/user paths.
-    let actual=scope.to_string_lossy();let shown=format!("{}:\\VolumeTrail Samples\\临时转储",actual.chars().next().unwrap());
+    let actual=scope.to_string_lossy();let shown=if scenario=="long-path" || scenario=="preview-expanded" {
+        format!("{}:\\VolumeTrail Samples\\很长的项目目录与同名父目录\\2026 年归档样本\\应用运行与诊断日志\\临时转储文件夹",actual.chars().next().unwrap())
+    } else {format!("{}:\\VolumeTrail Samples\\临时转储",actual.chars().next().unwrap())};
     for rule in &mut state.rules {rule.directory=shown.clone();}
     if let Some(rule)=&mut state.editor {rule.directory=shown.clone();}
     if let Some(rule)=&mut state.original {rule.directory=shown.clone();}
@@ -267,6 +317,17 @@ fn run_time(timestamp:i64)->String {chrono::DateTime::from_timestamp(timestamp,0
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn long_candidate_path_fits_narrow_column_and_keeps_filename() {
+        let ctx=egui::Context::default();let path="E:\\VolumeTrail Samples\\很长的项目目录与同名父目录\\2026 年归档样本\\应用运行与诊断日志\\临时转储文件夹\\crash.dmp";
+        let input=egui::RawInput {screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(196.0,500.0))),..Default::default()};
+        let _=ctx.run(input,|ctx| {egui::CentralPanel::default().show(ctx,|ui| {
+            let short=fitted_path(ui,path);
+            assert!(short.starts_with("E:\\"));assert!(short.ends_with("crash.dmp"));assert!(short.contains('…'));
+            let width=ui.painter().layout_no_wrap(short,egui::TextStyle::Body.resolve(ui.style()),INK).size().x;
+            assert!(width<=180.0);
+        });});
+    }
     #[test]
     fn busy_cleanup_keeps_its_receipt_cancel_request_and_editor() {
         let temp=tempfile::tempdir().unwrap();let mut app=VolumeTrailApp::new(&egui::Context::default(),temp.path().into()).unwrap();

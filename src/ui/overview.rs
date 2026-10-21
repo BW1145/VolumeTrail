@@ -126,7 +126,7 @@ impl VolumeTrailApp {
     }
 }
 
-fn middle_path(path: &str, max: usize) -> String {
+pub(super) fn middle_path(path: &str, max: usize) -> String {
     let chars: Vec<_> = path.chars().collect();
     if chars.len() <= max { return path.into(); }
     let left = max.saturating_sub(1)/2;
