@@ -4,6 +4,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use std::{collections::{HashMap, HashSet}, fs, path::{Path, PathBuf}, time::{Duration, Instant}};
 mod operations;
+mod cleanup;
 
 pub struct Store {
     db: Connection,
@@ -240,6 +241,7 @@ impl Store {
                 PRAGMA user_version=7; COMMIT;")?;
         }
         Self::migrate_operations(&db)?;
+        Self::migrate_cleanup(&db)?;
         Ok(Self { db, path: path.to_path_buf(), staging: false, cancel_path: None, commit_timings: CommitTimings::default() })
     }
 

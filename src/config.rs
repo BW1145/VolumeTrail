@@ -31,7 +31,7 @@ impl AppConfig {
 
     pub fn save(&self, data: &Path) -> Result<()> {
         self.validate()?;
-        fs::write(data.join("config.json"), serde_json::to_vec_pretty(self)?)
+        crate::atomic::write(&data.join("config.json"), &serde_json::to_vec_pretty(self)?)
             .context("Save VolumeTrail configuration")?;
         Ok(())
     }
