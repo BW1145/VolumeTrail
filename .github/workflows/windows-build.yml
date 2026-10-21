@@ -2,7 +2,7 @@ name: Windows build and tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, codex/overview-cleanup]
   pull_request:
   workflow_dispatch:
 
@@ -42,6 +42,18 @@ jobs:
 
       - name: Test all application targets
         run: ./build.ps1 test -CargoArgs '--locked','--all-targets'
+
+      - name: Validate cleanup on an isolated NTFS VHD
+        run: ./tests/run-isolated-ntfs.ps1
+
+      - name: Upload isolated NTFS evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: VolumeTrail-isolated-ntfs-${{ github.sha }}
+          path: evidence/ntfs-ci/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Build portable GUI and CLI
         run: ./build.ps1 package
