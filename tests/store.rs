@@ -763,6 +763,7 @@ fn overview_groups_verification_and_preserves_real_observations() {
     let b = store.publish("C:\\", &[file(30,"a.bin",30)], &outcome(ScanMode::Incremental,20)).unwrap();
     let c = store.publish("C:\\", &[Mutation::Delete(30)], &outcome(ScanMode::Incremental,30)).unwrap();
     store.mark_verification(b,"verified",Some(c)).unwrap();
+    assert_eq!(store.reports().unwrap()[0].operation_pre,Some(b));
     let overview = volumetrail::overview::load(&store,"C:\\").unwrap();
     assert_eq!((overview.interval.as_ref().unwrap().from,overview.interval.as_ref().unwrap().to),(a,b));
     assert_eq!(overview.latest.unwrap().id,c);

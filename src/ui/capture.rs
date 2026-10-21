@@ -27,7 +27,12 @@ pub fn run()->Result<()> {
         store.publish(&root,&[directory(20,5,"Samples"),directory(21,20,"相同目录名"),directory(22,5,"工作目录"),directory(23,22,"相同目录名"),
             file(30,21,"cache.bin",1024*1024*1024),file(31,23,"archive.bin",3*1024*1024*1024)],&sample)?;
         sample.mode=ScanMode::Incremental;sample.checkpoint.next_usn=20;sample.free-=2*1024*1024*1024;sample.sampled_at="2026-10-21T09:00:00+00:00".into();
-        store.publish(&root,&[file(30,21,"cache.bin",4*1024*1024*1024),file(31,23,"archive.bin",2*1024*1024*1024)],&sample)?;
+        let second=store.publish(&root,&[file(30,21,"cache.bin",4*1024*1024*1024),file(31,23,"archive.bin",2*1024*1024*1024)],&sample)?;
+        if scenario=="history" {
+            sample.checkpoint.next_usn=30;sample.free+=1024*1024*1024;sample.sampled_at="2026-10-21T09:00:08+00:00".into();
+            let post=store.publish(&root,&[file(30,21,"cache.bin",3*1024*1024*1024)],&sample)?;
+            store.mark_verification(second,"verified",Some(post))?;
+        }
     }
     let captured=Arc::new(AtomicBool::new(false));let done=captured.clone();
     eframe::run_native("VolumeTrail visual fixture",eframe::NativeOptions {
@@ -36,7 +41,8 @@ pub fn run()->Result<()> {
     },Box::new(move |cc| {
         cc.egui_ctx.set_zoom_factor(scale);
         let mut app=VolumeTrailApp::new(&cc.egui_ctx,data.clone())?;app.drive=drive;app.refresh();
-        if scenario!="overview" && scenario!="empty" {super::cleanup::prepare_capture(&mut app,&scope,&scenario)?;}
+        if scenario=="history" {app.view=View::History;}
+        else if scenario!="overview" && scenario!="empty" {super::cleanup::prepare_capture(&mut app,&scope,&scenario)?;}
         Ok(Box::new(Capture {app,output,done,started:Instant::now(),requested:false,frames:0}))
     })).map_err(|e|anyhow::anyhow!("Native visual capture: {e}"))?;
     anyhow::ensure!(captured.load(Ordering::SeqCst),"Native capture timed out without an image");

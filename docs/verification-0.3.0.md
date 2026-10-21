@@ -6,7 +6,7 @@
 
 ## 实现
 
-- GUI/CLI 共用 overview 服务，操作前/核验点分组，当前索引容量独立于已保留历史点。
+- GUI/CLI 共用 overview 服务，操作前/核验点分组，当前索引容量独立于已保留历史点；历史列表按操作分组，观测菜单保留逐点精确时间和选择。
 - 规则保存在独立 SQLite 表，默认暂停；修订检查、预览、启用、执行和结果共用业务模块。
 - Windows 独立模块逐级固定目录句柄，检查重解析属性和完整文件身份，独占叶文件句柄后设置删除 disposition。
 - 登录流程沿用原全局锁，成功扫描后才清理；每日声明防重复；手动扫描不接删除。
@@ -44,13 +44,13 @@ LIST_DIRECTORY，固定期间重命名失败的回归通过。这是阶段三之
 实际应用 UI，读取 framebuffer 保存 PNG，并自动退出。没有接管桌面或发送用户输入。
 
 本地 `evidence/ui/`：overview-1050、overview-760、preview-1050、preview-760-125、
-result-1050、error-760、empty-760。1050×720 / 760×520 是逻辑窗口尺寸；本机 Windows DPI
+result-1050、history-1050、error-760、empty-760。1050×720 / 760×520 是逻辑窗口尺寸；本机 Windows DPI
 实际为 175%，物理截图相应约 1838×1260 / 1330×910。`125` 表示额外 125% 应用缩放，未改系统缩放。
 人工阅读截图检查了中文、长目录、布局、增减符号、空/错误与核验未完成提示；窄窗口通过纵向滚动容纳表单。
 
 这些图片只证明实际渲染，不等于真实点击、键盘、滚动、焦点或完整用户操作验收。
 复现：`cargo build --features ui-capture --example ui_capture`，然后运行
-`ui_capture OUTPUT.png overview|preview|result|error|empty WIDTH HEIGHT SCALE`。
+`ui_capture OUTPUT.png overview|preview|result|history|error|empty WIDTH HEIGHT SCALE`。
 result 场景只删除它自己刚创建的两个 fixture 文件；scope 和数据库均在输出目录内。
 
 ## 性能样本（调试构建，同机同样本）

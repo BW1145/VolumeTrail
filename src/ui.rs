@@ -1,3 +1,4 @@
+mod history;
 #[cfg(feature="ui-capture")]
 pub mod capture;
 mod cleanup;
@@ -637,50 +638,6 @@ impl VolumeTrailApp {
             }
         });
         if self.folders.len() == 5000 { ui.label("当前只显示前 5000 项。"); }
-    }
-
-    fn history_view(&mut self, ui: &mut egui::Ui) {
-        ui.heading("扫描记录");
-        let reports: Vec<Report> = self.reports.iter().filter(|report| report.root.starts_with(self.drive)).cloned().collect();
-        ui.horizontal(|ui| {
-            let all_selected = !reports.is_empty() && reports.iter().all(|report| self.history_selection.contains(&report.id));
-            if ui.add_enabled(!reports.is_empty(), egui::Button::new(if all_selected { "取消全选" } else { "全选可见记录" })).clicked() {
-                if all_selected { self.history_selection.clear(); }
-                else { self.history_selection.extend(reports.iter().map(|report| report.id)); }
-            }
-            let can_edit = !self.history_selection.is_empty() && !self.any_running && self.history_rx.is_none();
-            if ui.add_enabled(can_edit, egui::Button::new(format!("清理明细 ({})", self.history_selection.len())))
-                .on_hover_text("保留扫描时间、空间用量和文件夹变化汇总").clicked() {
-                let ids: Vec<i64> = self.history_selection.iter().copied().collect();
-                self.start_history_job(worker::HistoryAction::ClearDetails(ids));
-            }
-            if ui.add_enabled(can_edit, egui::Button::new(format!("删除所选 ({})", self.history_selection.len()))).clicked() {
-                let ids: Vec<i64> = self.history_selection.iter().copied().collect();
-                self.start_history_job(worker::HistoryAction::Delete(ids));
-            }
-            if ui.add_enabled(!self.any_running && self.history_rx.is_none(), egui::Button::new("按容量整理")).clicked() {
-                self.start_history_job(worker::HistoryAction::Prune(self.saved_config.budget_bytes()));
-            }
-        });
-        if self.history_rx.is_some() { ui.label("正在整理历史…"); }
-        if let Some(message) = &self.history_message { ui.label(RichText::new(message).color(GREEN)); }
-        egui::ScrollArea::vertical().show_rows(ui, 30.0, reports.len(), |ui, range| {
-            for report in reports[range].iter().cloned() {
-                ui.horizontal(|ui| {
-                    let mut checked = self.history_selection.contains(&report.id);
-                    if ui.checkbox(&mut checked, "").changed() {
-                        if checked { self.history_selection.insert(report.id); }
-                        else { self.history_selection.remove(&report.id); }
-                    }
-                    if ui.selectable_label(Some(report.id) == self.selected,
-                        format!("{}  ·  {}  ·  {} 已用  ·  {}", scan_time(&report.finished), scan_mode_label(&report.mode),
-                            bytes(report.total.saturating_sub(report.free)), if report.details { "含明细" } else { "时间点" }))
-                        .clicked()
-                    { self.selected = Some(report.id); self.load_selected(); self.view = View::Overview; }
-                });
-            }
-        });
-        if self.reports.len() == 500 { ui.label("当前只显示最近 500 次扫描。"); }
     }
 
     fn start_history_job(&mut self, action: worker::HistoryAction) {

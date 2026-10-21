@@ -41,6 +41,8 @@ pub struct Report {
     pub details: bool,
     pub aggregate: u8,
     pub performance: Option<ScanPerformance>,
+    pub operation_pre: Option<i64>,
+    pub verification: String,
 }
 
 #[derive(Clone, Debug)]
@@ -858,7 +860,8 @@ impl Store {
     pub fn reports(&self) -> Result<Vec<Report>> {
         let version: i64 = self.db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let performance = if version >= 6 { "performance" } else { "NULL" };
-        let mut stmt = self.db.prepare(&format!("SELECT id,root,volume,finished,mode,total,free,logical,allocated,file_count,warnings,sampled,details,aggregate,{performance} FROM scans ORDER BY id DESC"))?;
+        let operation = if version >= 8 {"operation_pre,verification"} else {"NULL,'not_needed'"};
+        let mut stmt = self.db.prepare(&format!("SELECT id,root,volume,finished,mode,total,free,logical,allocated,file_count,warnings,sampled,details,aggregate,{performance},{operation} FROM scans ORDER BY id DESC"))?;
         let mut rows = stmt.query([])?;
         let mut reports = vec![];
         while let Some(r) = rows.next()? {
@@ -866,7 +869,8 @@ impl Store {
                 total: r.get::<_, i64>(5)? as u64, free: r.get::<_, i64>(6)? as u64, logical: r.get::<_, i64>(7)? as u64,
                 allocated: r.get::<_, i64>(8)? as u64, file_count: r.get::<_, i64>(9)? as u64, warnings: serde_json::from_str(&r.get::<_, String>(10)?)?,
                 sampled: r.get(11)?, details: r.get::<_, i64>(12)? != 0, aggregate: r.get::<_, i64>(13)? as u8,
-                performance: r.get::<_, Option<String>>(14)?.map(|json| serde_json::from_str(&json)).transpose()? });
+                performance: r.get::<_, Option<String>>(14)?.map(|json| serde_json::from_str(&json)).transpose()?,
+                operation_pre:r.get(15)?,verification:r.get(16)? });
         }
         Ok(reports)
     }

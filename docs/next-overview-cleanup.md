@@ -128,3 +128,8 @@ CLI 真调用验证中文空格路径、空结果、分页、失败 JSON、修�
   改为 LIST_DIRECTORY。准备原生隐藏窗口渲染证据与独立样本性能 JSON；见 verification-0.3.0.md。
   当前仍缺外部 UI 交互驱动与隔离卷上的真实 USN/登录流程验收；probe E 拒绝访问。
   Windows 审查包保留这些未覆盖项，不当作可发布版本。原用户现已明确同意远端分支推送，将仅重试一次。
+
+- 最终补齐：历史页也按操作分组（保持可视行分页绘制），观测菜单提供逐点精确时间和选择；
+  CLI summary 返回 operation_pre/verification。默认回归仍为 60 项通过。新增 history-1050 原生渲染样本。
+  用户具体确认后，远端 codex/overview-cleanup 推送成功，阶段四头为 217642bfc220d5f97c1fe3a2bc7b3e77b3ac2d5d；
+  后续分组补齐提交继续推送同一分支。未合并、未发布，交互和隔离 USN 验收仍未完成。
