@@ -64,3 +64,11 @@ SQLite 索引、扫描历史和配置位于便携程序旁的 `data/`。
 
 本机截图、诊断导出和个人笔记统一放在 `local-notes/` 或 `evidence/`。
 提交文档和测试时使用 `Example` 等通用用户名以及相对项目路径；环境变量、凭据与私钥在忽略规则内。
+
+## 许可证
+
+Copyright (C) 2026 BW1145.
+
+本项目的原创代码与文档采用 GNU General Public License v3.0 only（SPDX：`GPL-3.0-only`）许可，完整条款见 [LICENSE](LICENSE)。
+
+第三方代码、依赖及资源继续适用各自的许可证；其原有版权声明和许可条款保持有效。
