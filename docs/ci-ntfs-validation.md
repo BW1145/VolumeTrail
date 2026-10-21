@@ -19,6 +19,8 @@ GitHub 的[托管 runner 文档](https://docs.github.com/en/actions/reference/ru
 - 文件夹删除增量等于该候选占用；再一次 USN 增量中样本目录变化为零，删除只计一次。
 - 空数据库 RequireIncremental 拒绝首次全量，并保持无报告。
 - 仅在该 VHD 使用 `fsutil usn deletejournal /n` 并重新创建日志；要求核验拒绝全量回退，数据库游标与报告数保持不变。
+- 真实便携 CLI scan-auto 完成清理和增量核验；同日第二次自动扫描不会重复清理，手动 scan 保留新匹配文件。
+- 独立数据库首次自动扫描在忙碌状态收到取消信号后失败；不生成清理任务，样本文件保留。不注册登录任务。
 - 记录全量、增量、清理加核验耗时与断言结果到 `evidence/ntfs-ci/runtime.json`。
 
 `/n` 的同步等待语义见 [Microsoft fsutil usn](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/fsutil-usn)。
