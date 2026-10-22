@@ -1,7 +1,7 @@
 # VolumeTrail 下一版：批准范围与实施记录
 
 批准实施日期：2026-10-21。基线 `9bbe856`，工作分支 `codex/overview-cleanup`。
-本文件是用户批准计划的实施约束；阶段记录见文末。未合并、未发布、未替换已安装程序。
+本文件保留批准计划与发布前阶段记录。**当前 v0.3.0 已经由 [PR #1](https://github.com/BW1145/VolumeTrail/pull/1) 合并 main 并[正式发布](https://github.com/BW1145/VolumeTrail/releases/tag/v0.3.0)**；使用说明见 [README](../README.md)。以下“未合并/未发布”及阶段限制是当时快照，不代表当前发布状态；不据此重复构建或发布。未替换用户已安装程序。
 
 ## 目标和边界
 

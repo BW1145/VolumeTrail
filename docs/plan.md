@@ -1,12 +1,31 @@
-# VolumeTrail v2 implementation
+# VolumeTrail v0.3.0 implementation
 
 ## Product
 
 Portable Rust + egui app with a separate scan process. The scan starts at login
 when enabled, processes the configured NTFS volumes sequentially, then exits.
-SQLite and configuration live beside the executable in `data/`.
+SQLite and configuration live beside the executable in `data/`. v0.3.0 is
+[published](https://github.com/BW1145/VolumeTrail/releases/tag/v0.3.0);
+installation and data-preserving upgrades are in the [README](../README.md).
 
 ## Delivered behavior
+
+- The compact overview shares a query service with `query overview`. It shows
+  current-index usage, the growth interval, leading increases/decreases and the
+  latest cleanup result; cleanup verification points stay linked to their scan.
+- User-defined cleanup rules bind a volume, directory, filename patterns,
+  recursion and modification age. Saving or editing always pauses the rule.
+  A 15-minute preview precedes explicit one-time deletion or separate automatic
+  enablement. Deletion is permanent, with no recycle bin or file-content backup.
+- Enabled rules run after a successful login scan on their configured volume,
+  at most once per rule per local day. Manual scans only scan. The existing
+  login task lifecycle is reused; enabling a rule does not install that task.
+- Cleanup records retain rule snapshots, item outcomes and allocation estimates;
+  execution and index verification are independent states. Cancellation stops
+  subsequent files and never restores deleted ones. Interrupted items are not
+  replayed. See [automation.md](automation.md) for permissions and retention.
+- `capabilities --json` discovers the structured query/rule/preview/execution
+  interface. Plan IDs and acknowledgement flags do not establish user authorization.
 
 - Scan summaries retain sample time, completion time, disk capacity/free space,
   indexed bytes and file count. The chart can show 7, 30, 365 days or all points.
@@ -34,12 +53,14 @@ SQLite and configuration live beside the executable in `data/`.
   obtained at scan boundaries, with no additional performance sampling loop.
 - One global lock serializes scans and history writes across all volumes.
   UI comparisons and rankings use separate read-only connections.
-- Opening an older database creates a consistent backup and migrates its schema.
-  Legacy changes are aggregated to the extent their saved deltas permit.
+- Opening an older database migrates its schema. The pre-v2 migration backs up
+  existing scan history; this is not an automatic backup for every upgrade.
+  Preserve a separate full `data/` copy before upgrading. Legacy changes are
+  aggregated to the extent their saved deltas permit.
 
 ## Verification
 
-`build.ps1 test -CargoArgs '--lib','--test','store'` covers accounting, movement, history deletion/carry, retention,
+`build.ps1 test -CargoArgs '--locked','--all-targets'` covers accounting, movement, history deletion/carry, retention,
 current-index queries, cancellation rollback and legacy migration. A second test
 can migrate an isolated copy of the installed database by setting
 `DISKHISTORY_MIGRATION_SOURCE` to its path before running tests. `build.ps1 package`
@@ -48,3 +69,9 @@ creates the UI and console executables in `dist/VolumeTrail/`.
 The 5-minute incremental runtime goal is a target, not a timeout. Full scans
 run to completion unless stopped. Runtime measurements and visual UI acceptance
 are recorded separately from the automated tests.
+
+For the released v0.3.0 source, [Windows CI #39587285000](https://github.com/BW1145/VolumeTrail/actions/runs/39587285000)
+passed all-target tests and the isolated NTFS cleanup checks. The
+[NTFS validation scope](ci-ntfs-validation.md) distinguishes CLI lifecycle checks
+from actual Windows login-task and desktop interaction acceptance. Earlier
+[verification notes](verification-0.3.0.md) are pre-release snapshots.

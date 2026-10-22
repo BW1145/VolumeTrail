@@ -1,69 +1,103 @@
 # 盘迹 · VolumeTrail
 
-轻量的 Windows NTFS 磁盘空间变化记录工具，用于查明哪些目录占用了更多空间，并为手动清理和 AI 分析提供记录。
+轻量的 Windows NTFS 磁盘空间变化与文件清理工具。查明空间增长来源，按自己配置的规则预览和清理文件，并通过结构化 CLI 供 AI 查询与操作。
+
+当前正式版本：**[v0.3.0](https://github.com/BW1145/VolumeTrail/releases/tag/v0.3.0)**。
 
 ## 功能
 
-- 登录后自动扫描配置的磁盘，保存结果后退出。
-- 首次建立全量索引，后续通过 USN 变化日志进行增量扫描；同一文件的重复事件会先合并。
-- 系统繁忙时暂停，使用后台资源优先级；支持手动扫描和停止。
-- 查看空间趋势、两个时间点之间的目录净变化、文件明细和当前占用排行。
-- 目录下钻显示总变化、本层变化及子目录构成；已移除的目录仍可查询历史。
-- 打开文件位置，使用命令行读取文本或 JSON 结果。
-- 保存扫描耗时、CPU 用时、平均 CPU 占用和进程峰值内存。
-- 按容量整理历史明细，保留趋势时间点；索引、历史和备份的占用分别显示。
+- 简洁概览集中显示剩余空间、主要增长与减少目录、容量趋势和最近清理结果。
+- 登录后自动扫描配置的磁盘，保存结果后退出；系统繁忙时让步，支持手动扫描和停止。
+- 首次建立全量索引，后续通过 USN 日志增量扫描；同一文件的重复事件先合并。
+- 查看两个时间点间的目录净变化、文件明细和当前占用排行；支持目录下钻和历史目录查询。
+- 手动配置文件清理规则：指定目录、文件名匹配、是否包含子目录和至少多少天未修改；保存后默认暂停。
+- 预览后确认单次删除，或另行启用登录扫描后的自动清理；保留规则快照、执行明细与统计复核状态。
+- GUI 与 CLI 共用查询和清理逻辑；AI 可发现能力、读取 JSON、管理规则、预览和查询执行结果。
+- 保存扫描性能记录，按容量整理扫描历史明细；索引、历史和迁移备份分别计量。
 
-程序用于记录和定位空间变化，用户文件的清理由用户决定并执行。
+## 下载、运行与升级
 
-## 运行
+1. 在 [v0.3.0 Release](https://github.com/BW1145/VolumeTrail/releases/tag/v0.3.0) 下载
+   [VolumeTrail-0.3.0-windows-x64.zip](https://github.com/BW1145/VolumeTrail/releases/download/v0.3.0/VolumeTrail-0.3.0-windows-x64.zip)。普通用户选这个便携包，源码归档用于开发。
+2. 解压到有写入权限的独立目录，可放在非 C 盘；运行 `VolumeTrail.exe` 打开界面，`VolumeTrail-cli.exe` 用于命令行。Windows x64 运行时只依赖系统组件，无需安装开发工具。
+3. 首次打开后选择要扫描的 NTFS 磁盘并手动扫描。需要登录扫描时，在设置中开启“登录后扫描一次”。多个磁盘按顺序扫描。
 
-便携包包含 `VolumeTrail.exe` 和 `VolumeTrail-cli.exe`。双击前者打开界面。
-程序和 `data/` 放在一起，可以安装到非 C 盘。便携包运行时只依赖 Windows 系统组件。
-
-原始 NTFS 扫描需要管理员权限。界面会在启动扫描时请求权限，查看已有记录和命令行查询使用普通权限即可。
-自动扫描使用 Windows 任务计划程序，由设置页开启。多个磁盘按顺序扫描。
+校验下载：同时下载 Release 中的 [SHA256SUMS.txt](https://github.com/BW1145/VolumeTrail/releases/download/v0.3.0/SHA256SUMS.txt)，在 PowerShell 中运行下列命令，将输出与对应文件名那一行比较。该清单也包含解压后的两个 EXE 的校验值。
 
 ```powershell
-.\VolumeTrail-cli.exe query summary --drive C --limit 20 --json
-.\VolumeTrail-cli.exe query growth --drive C --from 8 --to 16 --json
-.\VolumeTrail-cli.exe query folder --drive C --path 'C:\Users\Example\AppData\Local' --from 8 --to 16 --json
+Get-FileHash .\VolumeTrail-0.3.0-windows-x64.zip -Algorithm SHA256
 ```
 
-比较命令中的扫描编号应替换为已有记录的编号。完整查询说明见 [docs/query.md](docs/query.md)。
+[COMMIT.txt](https://github.com/BW1145/VolumeTrail/releases/download/v0.3.0/COMMIT.txt) 记录实际构建提交；
+[BUILD-PROVENANCE.json](https://github.com/BW1145/VolumeTrail/releases/download/v0.3.0/BUILD-PROVENANCE.json) 说明构建、CI 与版本标签的对应关系。
+
+**升级保留整个 `data/`：**先退出界面，等待或停止扫描、清理进程，备份程序旁完整的 `data/`（包括存在的数据库配套文件），再用新包替换程序文件。不要删除或覆盖旧 `data/`；新版首次打开会迁移数据库。迁移前的副本应单独保留，供需要回退时使用。换目录安装时，将完整 `data/` 一起复制到新程序旁；若已配置登录扫描，需在设置中重新关闭、开启，使任务指向新路径。
+
+## 文件清理：先预览，再确认
+
+**清理会直接、永久删除文件，不进入回收站，不备份文件内容，无法撤销。停止操作只停止后续文件，已完成的删除保留。**
+
+1. 从设置进入“文件清理规则”，或在目录详情选择“为此目录创建清理规则…”。填写目标目录、文件名模式（如 `*.dmp; *.tmp`）、子目录范围和未修改天数。
+2. 点击“保存并暂停”。新建和修改后的规则均暂停；包含子目录默认关闭，`0` 天表示不按时间保留。保存规则不会删除文件或开启自动清理。
+3. 点击“预览匹配”，核对目录、候选文件、占用估算、跳过原因及截断提示。预览有效期为 **15 分钟**，过期或规则修订变化后需重新预览。界面最多展示前 200 个候选，CLI JSON 可读取计划内完整候选。
+4. 勾选直接删除确认后，选择“删除本次匹配文件”执行一次；它只重新核对计划内文件，不增加预览后新出现的文件。单次执行不会启用规则。
+5. 要持续自动清理，另选“启用此规则：登录扫描后自动清理”。仅在该卷配置的登录扫描成功后运行，同一规则每天最多自动运行一次；以后会按授权范围重新匹配新文件。启用规则不会创建登录任务，也不会把该卷加入扫描列表。截断预览需缩小范围后重试；手动扫描只扫描，不执行规则。
+
+规则只接受本地绝对目录和文件名 `*` / `?` 通配符。程序拒绝根目录及与系统、程序和自身数据目录重叠的范围；跳过重解析点、多硬链接、云占位、离线、只读、系统文件及权限或占用冲突。目录本身不删除。“暂停”停止今后的自动运行，“删除规则”仅移除配置；进行中的操作使用“停止后续文件”。
+
+**权限：**查看已有记录和 `query` 查询使用普通权限；规则管理、预览与执行需要能写入 `data/`，预览需要目标目录读取权限，删除还需相应删除权限。清理执行器不会自行请求提权、修改 ACL 或绕过占用。原始 NTFS 扫描及清理后的索引复核需要管理员权限：GUI 扫描时请求 UAC，CLI `scan` 需在管理员终端运行。登录任务按最高可用权限运行，已启用规则随该任务权限执行；其安装、移除由设置页请求权限。
+
+## 清理记录与执行结果
+
+“文件清理规则”页的“最近清理结果”可打开执行明细；概览显示最近清理摘要。记录包含当时的规则快照、删除/跳过/失败数量、文件结果、已删除占用估算和扫描复核状态。
+
+- “完成/部分完成/已取消/异常中断”描述执行情况；“文件统计已更新/待下次扫描更新”单独描述索引复核。**统计待更新不代表文件没有删除**，不要据此再次执行删除。
+- 已删除占用是估算；实际可用空间变化还受其他程序同时写入影响。中断后的未决项会标记为结果未确定，不自动重放删除。
+- 终态逐项明细最多保留 200 条/次、30 天，当前未决项另行保护；汇总最多保留 1000 次且最多 365 天，已裁剪内容会标明。
+
+“历史整理”只管理扫描记录，与实际删除用户文件的“文件清理规则”分开。
+
+## AI CLI 基本使用
+
+在便携目录打开 PowerShell。首次使用或升级后先打开 GUI，完成数据库初始化/迁移；空间查询需要已有扫描记录。
+
+```powershell
+.\VolumeTrail-cli.exe capabilities --json
+.\VolumeTrail-cli.exe query overview --drive C --json
+.\VolumeTrail-cli.exe query summary --drive C --limit 20 --json
+.\VolumeTrail-cli.exe cleanup list --json
+.\VolumeTrail-cli.exe cleanup runs --drive C --limit 20 --json
+```
+
+查询不会自动扫描或清理。清理流程为 `save`（默认暂停）→ `preview` → 用户确认范围与永久删除后 `execute`，自动启用需另行确认 `enable`。AI 持有命令访问权、计划编号或确认参数不等于用户已经授权删除。
+
+完整规则 JSON、预览、确认参数、结果查询与退出码见 [AI / 自动化接口](docs/automation.md)；空间变化查询参数见 [查询接口](docs/query.md)。
 
 ## 开发
 
-使用 Rust、egui/eframe、SQLite 和 Windows API。当前版本为 0.2.2。
-
-从源码构建需要 Windows x64、Rust GNU 工具链和 LLVM-MinGW。
-完整的下载、校验、安装、测试和打包步骤见 [构建说明](docs/build.md)。
-普通用户运行便携包不需要安装这些开发工具。
-
-`build.ps1` 使用项目 `.tools/` 内的工具链。完成构建说明中的安装后运行：
+使用 Rust、egui/eframe、SQLite 和 Windows API。`Cargo.toml` 当前版本为 **0.3.0**。
+从源码构建需要 Windows x64、Rust GNU 工具链和 LLVM-MinGW，步骤见 [构建说明](docs/build.md)。
 
 ```powershell
-.\build.ps1 test -CargoArgs '--lib','--test','store'
+.\build.ps1 test -CargoArgs '--locked','--all-targets'
 .\build.ps1 package
 ```
 
-`package` 生成 `dist/VolumeTrail/` 中的 GUI 与 CLI 便携程序。
-当前便携包采用去除调试信息的 debug 构建；优化构建使用 `release` 命令。
-发布便携包时只包含程序文件，不包含运行后生成的 `data/`。
+`package` 生成 `dist/VolumeTrail/` 中的 GUI 与 CLI，采用去除调试信息的 debug 构建；优化构建使用 `release` 命令。发布文件中不包含运行后生成的 `data/`。
 
 ## 数据与文档
 
-SQLite 索引、扫描历史和配置位于便携程序旁的 `data/`。
-历史容量上限只限制文件明细与目录汇总；当前索引、趋势与性能记录、迁移备份分别计量。
+配置、SQLite 索引、扫描历史、清理规则与执行记录位于便携程序旁的 `data/`。这些记录不包含可用于恢复已删除文件的内容备份。扫描历史容量上限只限制文件明细与目录汇总；当前索引、趋势与性能记录、迁移备份及清理记录按各自规则管理。
 
 - [当前设计与实现](docs/plan.md)
-- [0.2.1 验证记录](docs/progress-2026-10-03.md)
+- [AI / 自动化接口](docs/automation.md)
 - [查询接口](docs/query.md)
 - [产品设计](docs/design.md)
+- [v0.3.0 发布说明与构建来源](https://github.com/BW1145/VolumeTrail/releases/tag/v0.3.0)
+- [隔离 NTFS 验证范围](docs/ci-ntfs-validation.md)
+- [0.3.0 发布前验证记录（历史快照）](docs/verification-0.3.0.md)
 
-仓库保存源码、测试和文档。扫描数据库、个人配置、构建缓存、便携产物及本机源码备份由 `.gitignore` 排除。
-
-本机截图、诊断导出和个人笔记统一放在 `local-notes/` 或 `evidence/`。
-提交文档和测试时使用 `Example` 等通用用户名以及相对项目路径；环境变量、凭据与私钥在忽略规则内。
+仓库保存源码、测试和文档；数据库、个人配置、构建缓存、便携产物及本机源码备份由 `.gitignore` 排除。本机截图、诊断导出和个人笔记放在 `local-notes/` 或 `evidence/`，提交示例使用通用用户名与相对项目路径，不提交凭据或私钥。
 
 ## 许可证
 

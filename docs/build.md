@@ -2,6 +2,7 @@
 
 这些步骤用于开发和自行打包。运行已构建的便携程序只需要 Windows，
 不需要安装 Rust、LLVM-MinGW、Node.js 或 Python。
+正式便携包的下载、校验、权限与保留 `data/` 的升级方式见 [README](../README.md#下载运行与升级)。
 
 ## 环境
 
@@ -71,7 +72,7 @@ Test-Path '.tools\llvm-mingw-20260908-msvcrt-x86_64\bin\x86_64-w64-mingw32-clang
 
 ```powershell
 .\build.ps1 check -CargoArgs '--locked'
-.\build.ps1 test -CargoArgs '--locked','--lib','--test','store'
+.\build.ps1 test -CargoArgs '--locked','--all-targets'
 .\build.ps1 package
 ```
 
@@ -98,7 +99,8 @@ Test-Path '.tools\llvm-mingw-20260908-msvcrt-x86_64\bin\x86_64-w64-mingw32-clang
 ```
 
 程序旁的 `data/` 在运行时创建，用来保存配置、文件路径、磁盘索引和历史。
-发布便携包时，只打包两个 `.exe`；不要打包自己使用过的整个目录。
+分发自己构建的程序时，包含两个 `.exe` 和相应校验/来源文件；不要包含自己运行生成的 `data/`。
+v0.3.0 正式 ZIP 与校验、构建来源附件已在 Release 发布，文档更新无需重新构建或发布。
 首次扫描为全量索引，后续扫描按 USN 日志增量更新。
 首次扫描耗时取决于磁盘规模；查看已有记录不需要管理员权限。
 

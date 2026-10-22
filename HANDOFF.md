@@ -1,6 +1,8 @@
 # VolumeTrail 项目交接
 
-当前实现与验证见 `docs/plan.md` 和 `docs/progress-2026-10-08.md`。本文保留 2026-09-13 的交接快照。
+当前正式版为 [v0.3.0](https://github.com/BW1145/VolumeTrail/releases/tag/v0.3.0)，已合并 main 并发布。当前使用说明见 [README](README.md)，实现见 [docs/plan.md](docs/plan.md)。
+
+以下保留 2026-09-13 的历史交接快照，“尚未实现”等描述仅代表当时状态。
 
 更新日期：2026-09-13。工作区：项目根目录。
 

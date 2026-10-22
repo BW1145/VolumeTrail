@@ -1,6 +1,12 @@
 # 0.3.0 候选实现与验证交接
 
-状态：代码和 Windows 审查包已准备；完整验收尚未完成，不能据此宣布自动清理版本可发布。
+当前状态：**[v0.3.0 已正式发布](https://github.com/BW1145/VolumeTrail/releases/tag/v0.3.0)，[PR #1](https://github.com/BW1145/VolumeTrail/pull/1) 已合并 main**。最终源码对应的 [Windows CI #39587285000](https://github.com/BW1145/VolumeTrail/actions/runs/39587285000) 已通过全目标测试与隔离 NTFS 验证；包与源码来源关系见 Release 附件。
+
+以下为发布前候选验证快照，保留当时证据与未覆盖项；“未发布”和阻塞描述不代表当前发布状态。真实桌面交互、真实登录触发等不因正式发布而补算通过，范围见 [ci-ntfs-validation.md](ci-ntfs-validation.md)。使用说明见 [README](../README.md)。
+
+## 发布前检查点
+
+状态：代码和 Windows 审查包已准备；检查点时完整验收尚未完成。
 分支 `codex/overview-cleanup`；远端基线 `ae8a1b355824dd82ed3fec668e389e7d1f32c9c0` 已合入。
 未合并 main、未发布 Release、未替换已安装程序、未修改现有登录任务。
 

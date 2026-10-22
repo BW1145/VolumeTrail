@@ -1,10 +1,11 @@
 # VolumeTrail
 
-Status: implementation authorized by the user on 2026-09-08.
+Current contract: v0.3.0, including the cleanup extension authorized on 2026-10-21.
+The original disk-growth recorder was authorized on 2026-09-08.
 
 ## Product contract
 
-A portable Windows disk-growth recorder. Default volume is C:. Users can add
+A portable Windows disk-growth recorder with user-configured file cleanup. Default volume is C:. Users can add
 other NTFS volumes. Application-owned configuration, index, history and logs
 live in data/ beside the executable. No file contents are backed up.
 
@@ -24,20 +25,38 @@ live in data/ beside the executable. No file contents are backed up.
 - UI includes overview and long-term trend filters, folder browser and largest
   items, change history and drilldown, settings, manual scan, cancellation and
   opening/selecting the target in Windows Explorer.
-- No cleanup/deletion of user files, cloud service, account or telemetry.
+- File cleanup is limited to explicitly configured local directories, filename
+  patterns, recursion and modification age; saving/editing leaves rules paused.
+  Preview expires after 15 minutes. One-time execution and automatic enablement
+  require separate explicit user authorization. Deletion is permanent: no undo,
+  recycle bin or file-content backup. Cancellation only stops subsequent files.
+- Enabled rules run after a successful login scan, at most once per rule per
+  local day. Manual scan does not clean. Enabling a rule does not create a task
+  or add its volume to the configured scan list.
+- Cleanup results retain rule snapshots, bounded item outcomes and estimates.
+  Execution outcome and index verification are separate; a failed verification
+  does not mean deletion failed. Interrupted intentions are not replayed.
+- No cloud service, account or telemetry.
 - Normal automatic completion is silent; failed/cancelled runs are visible in UI.
 - Startup configuration is opt-in in the UI and requires elevation when needed.
 
 ## Architecture
 
-Rust application with a scan-only worker mode and an egui/eframe report UI.
+Rust application with a worker process and an egui/eframe report UI. The manual
+scan path scans only; the login worker also runs enabled cleanup rules.
 SQLite stores current file records, scan summaries, per-file deltas and folder
-interval aggregates. `VolumeTrail-cli.exe` exposes read-only text/JSON queries.
+interval aggregates plus cleanup rules, previews and execution records.
+`VolumeTrail-cli.exe` exposes text/JSON queries and the structured
+[automation interface](automation.md) for rule management and cleanup.
 The NTFS parser is reused from an existing open-source library and validated
 against real-volume fixtures. Windows APIs provide USN access, file identity,
 allocation, task scheduling and Explorer integration. No custom kernel driver.
 Worker and UI coordinate cancellation via a local flag file and a global scan
-lock. UI does not require administrator rights for reading reports.
+lock, also used by cleanup writes. UI does not require administrator rights for
+reading reports. Cleanup uses current-process permissions without automatic
+UAC or ACL changes; raw NTFS scans/verification need administrator access.
+The existing login task runs at the highest available privilege, inherited by
+its enabled cleanup rules. See the [README](../README.md) for user instructions.
 
 ## Correctness
 
@@ -47,6 +66,11 @@ failures are reported and cannot become deletions. Volume identity is independen
 drive-letter reuse. Directory identities permit subtree moves without treating
 unchanged descendants as deleted. Full scans and incremental updates are
 published transactionally. Only complete scans participate in comparisons.
+
+Cleanup pins ancestor directory handles and rechecks file identity and metadata
+before deleting only previewed candidates. Protected scopes, reparse points,
+multi-linked and special-attribute files are excluded. Index verification uses
+incremental scanning only; an unavailable journal leaves statistics unverified.
 
 ## Verification
 
