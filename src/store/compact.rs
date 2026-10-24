@@ -41,6 +41,7 @@ pub(super) fn read_entry(row: &Row<'_>) -> rusqlite::Result<Entry> {
 }
 
 type HistoryRow=(i64,String,String,i64,i64,String);
+pub(super) type IdHistoryRow=(i64,i64,i64,i64,i64,String);
 
 #[derive(Serialize,Deserialize)]
 #[serde(untagged)]
@@ -53,6 +54,7 @@ fn deflate(json:&str)->std::io::Result<Vec<u8>> {
     encoder.write_all(json.as_bytes())?;encoder.finish()
 }
 
+#[cfg(test)]
 fn history_blob(rows:&[HistoryRow])->Result<Vec<u8>> {
     let original=serde_json::to_string(rows)?;
     let plain=deflate(&original)?;
@@ -71,8 +73,7 @@ fn history_blob(rows:&[HistoryRow])->Result<Vec<u8>> {
 }
 
 fn inflate(bytes: &[u8]) -> std::io::Result<String> {
-    let mut output = String::new();
-    ZlibDecoder::new(bytes).read_to_string(&mut output)?;
+    let mut output = inflate_raw(bytes)?;
     if output.starts_with('{') {
         let shared:SharedPaths=serde_json::from_str(&output)?;
         let mut paths=Vec::new();
@@ -89,12 +90,38 @@ fn inflate(bytes: &[u8]) -> std::io::Result<String> {
     Ok(output)
 }
 
+fn inflate_raw(bytes: &[u8]) -> std::io::Result<String> {
+    let mut output = String::new();
+    ZlibDecoder::new(bytes).read_to_string(&mut output)?;
+    Ok(output)
+}
+
+pub(super) fn decode_legacy(bytes: &[u8]) -> Result<Vec<HistoryRow>> {
+    Ok(serde_json::from_str(&inflate(bytes)?)?)
+}
+
+pub(super) fn decode_ids(bytes: &[u8]) -> Result<Vec<IdHistoryRow>> {
+    Ok(serde_json::from_str(&inflate_raw(bytes)?)?)
+}
+
+pub(super) fn encode_ids(rows: &[IdHistoryRow]) -> Result<Vec<u8>> {
+    let data = deflate(&serde_json::to_string(rows)?)?;
+    ensure!(decode_ids(&data)? == rows, "Compressed history verification failed");
+    Ok(data)
+}
+
 pub(super) fn configure(db: &Connection) -> Result<()> {
+    let version = db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?;
+    let shared = version >= 14;
     db.create_scalar_function("volumetrail_inflate", 1,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-        |context| inflate(context.get_raw(0).as_blob()?)
+        move |context| (if shared { inflate_raw(context.get_raw(0).as_blob()?) }
+            else { inflate(context.get_raw(0).as_blob()?) })
             .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error))))?;
-    let archived = db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? >= 12;
+    let archived = version >= 12;
+    let live_rows = if shared {
+        "SELECT seq,scan,old_path_id AS old_path,new_path_id AS new_path,logical_delta,allocated_delta,kind FROM changes"
+    } else { "SELECT rowid AS seq,scan,old_path,new_path,logical_delta,allocated_delta,kind FROM changes" };
     let archive_rows = if archived { " UNION ALL
         SELECT json_extract(j.value,'$[0]'),a.scan,
             json_extract(j.value,'$[1]'),json_extract(j.value,'$[2]'),
@@ -104,7 +131,7 @@ pub(super) fn configure(db: &Connection) -> Result<()> {
         " UNION ALL SELECT scan,SUM(entries) FROM change_archives GROUP BY scan"
     } else { "" };
     db.execute_batch(&format!("CREATE TEMP VIEW change_history AS
-        SELECT rowid AS seq,scan,old_path,new_path,logical_delta,allocated_delta,kind FROM changes{archive_rows};
+        {live_rows}{archive_rows};
         CREATE TEMP VIEW change_counts AS SELECT scan,COUNT(*) AS entries FROM changes GROUP BY scan{archive_counts};"))?;
     Ok(())
 }
@@ -144,16 +171,16 @@ impl Store {
             loop {
                 self.check_cancel()?;
                 let rows = {
-                    let mut stmt = tx.prepare("SELECT rowid,old_path,new_path,logical_delta,allocated_delta,kind
-                        FROM changes WHERE scan=? ORDER BY rowid LIMIT 256")?;
-                    stmt.query_map([scan], |r| Ok((r.get::<_, i64>(0)?,r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,r.get::<_, i64>(3)?,r.get::<_, i64>(4)?,r.get::<_, String>(5)?)))?
+                    let mut stmt = tx.prepare("SELECT seq,old_path_id,new_path_id,logical_delta,allocated_delta,kind
+                        FROM changes WHERE scan=? ORDER BY seq LIMIT 256")?;
+                    stmt.query_map([scan], |r| Ok((r.get::<_, i64>(0)?,r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,r.get::<_, i64>(3)?,r.get::<_, i64>(4)?,r.get::<_, String>(5)?)))?
                         .collect::<rusqlite::Result<Vec<_>>>()?
                 };
                 let Some(last) = rows.last().map(|row| row.0) else { break; };
-                let data=history_blob(&rows)?;
+                let data=encode_ids(&rows)?;
                 tx.execute("INSERT INTO change_archives VALUES(?,?,?,?)", params![scan,part,rows.len() as i64,data])?;
-                tx.execute("DELETE FROM changes WHERE scan=? AND rowid<=?", params![scan,last])?;
+                tx.execute("DELETE FROM changes WHERE scan=? AND seq<=?", params![scan,last])?;
                 part += 1;
             }
             self.check_cancel()?;

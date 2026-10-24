@@ -1,3 +1,4 @@
+mod common;
 use std::{fs,path::Path};
 use volumetrail::{cleanup::*,store::Store};
 
@@ -190,7 +191,7 @@ fn first_pending_intent_in_v9_migration_protects_the_next_growth_baseline() {
     run.state="running".into();run.deleted=0;run.unknown=0;run.verification="not_needed".into(); // stale summary must not override durable intent
     store.record_cleanup_item(&run,0,&RunItem {path:sample.to_str().unwrap().into(),state:"pending".into(),reason:None,allocated_bytes:4096}).unwrap();
     windows::delete_verified(sample.to_str().unwrap(),&plan.candidates[0].snapshot).unwrap();drop(store);
-    let db=rusqlite::Connection::open(&path).unwrap();db.execute_batch("ALTER TABLE scans DROP COLUMN comparison_from;DROP TABLE scan_baselines;PRAGMA user_version=9;").unwrap();drop(db);
+    let db=rusqlite::Connection::open(&path).unwrap();common::text_history(&db);db.execute_batch("ALTER TABLE scans DROP COLUMN comparison_from;DROP TABLE scan_baselines;PRAGMA user_version=9;").unwrap();drop(db);
     let mut store=Store::open(&path).unwrap();assert!(store.cleanup_baseline_pending(&run.volume_id).unwrap());
     store.recover_cleanup_runs().unwrap();assert_eq!(store.cleanup_run(&run.run_id).unwrap().unknown,1);assert!(store.cleanup_baseline_pending(&run.volume_id).unwrap());
     scan.mode=ScanMode::Incremental;scan.checkpoint.next_usn=20;scan.sampled_at="2026-10-21T11:00:00+00:00".into();

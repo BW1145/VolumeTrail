@@ -1,3 +1,4 @@
+mod common;
 use volumetrail::{model::*, store::{Change, Store}};
 
 fn outcome(usn: i64) -> ScanOutcome {
@@ -70,7 +71,7 @@ fn compact_index_migrates_legacy_payload_without_changing_file_identity_or_links
     store.publish("C:\\",&[Mutation::Upsert(entry.clone())],&outcome(1)).unwrap();drop(store);
     let db=rusqlite::Connection::open(&path).unwrap();
     db.execute("UPDATE nodes SET payload=? WHERE id=?",rusqlite::params![serde_json::to_string(&entry).unwrap(),entry.id as i64]).unwrap();
-    db.execute_batch("DROP TABLE change_archives; PRAGMA user_version=11;").unwrap();drop(db);
+    common::text_history(&db);db.execute_batch("DROP TABLE change_archives; PRAGMA user_version=11;").unwrap();drop(db);
     let store=Store::open(&path).unwrap();
     assert_eq!(store.indexed_entry("test-volume",entry.id).unwrap(),Some(entry.clone()));drop(store);
     let store=Store::open_read_only(&path).unwrap();assert_eq!(store.indexed_entry("test-volume",entry.id).unwrap(),Some(entry));

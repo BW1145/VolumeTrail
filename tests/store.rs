@@ -1,3 +1,4 @@
+mod common;
 use volumetrail::{model::*, store::Store};
 
 fn directory(id: u64, parent: u64, name: &str) -> Entry {
@@ -665,6 +666,10 @@ fn production_increment_replay_on_isolated_copy_when_requested() {
     drop(old);
     let mut store = Store::open(&copy).unwrap();
     let mut cp = store.checkpoint("C:\\").unwrap().unwrap();
+    let previous = store.reports().unwrap();
+    let previous_id = previous[0].id;
+    let previous_details = store.changes_count(&cp.volume_id, 0, previous_id, None).unwrap();
+    let previous_total = store.totals(&cp.volume_id).unwrap();
     let db = rusqlite::Connection::open_with_flags(&copy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     let count=std::env::var("DISKHISTORY_BENCH_RECORDS").ok().and_then(|n|n.parse::<i64>().ok()).unwrap_or(14000);
     let mut stmt = db.prepare("SELECT id FROM nodes WHERE volume=? AND is_dir=0 LIMIT ?").unwrap();
@@ -686,11 +691,18 @@ fn production_increment_replay_on_isolated_copy_when_requested() {
     cp.next_usn += 1;
     let mut sample = outcome(ScanMode::Incremental, cp.next_usn);
     sample.checkpoint = cp;
+    let mutations = entries.len() as u64;
     store.begin_stage().unwrap();
     for entry in entries { store.stage(entry).unwrap(); }
     let start = std::time::Instant::now();
-    store.commit_stage("C:\\", &sample).unwrap();
+    let id = store.commit_stage("C:\\", &sample).unwrap();
     println!("isolated commit of {count} resized records plus optional directory rename: {:.2}s; phases {:?}", start.elapsed().as_secs_f64(),store.commit_timings);
+    assert_eq!(store.reports().unwrap().len(), previous.len()+1);
+    assert_eq!(store.changes_count(&sample.checkpoint.volume_id, 0, previous_id, None).unwrap(), previous_details);
+    assert_eq!(store.changes_count(&sample.checkpoint.volume_id, previous_id, id, None).unwrap(), mutations);
+    let totals = store.totals(&sample.checkpoint.volume_id).unwrap();
+    assert_eq!(totals, (previous_total.0+count as u64*4096, previous_total.1+count as u64*4096));
+    assert_eq!(store.checkpoint("C:\\").unwrap().unwrap().next_usn, sample.checkpoint.next_usn);
 }
 
 #[test]
@@ -812,7 +824,7 @@ fn legacy_baseline_migration_keeps_provable_pairs_and_refuses_deleted_post_gaps(
         let a_post=store.publish("C:\\",&[file(30,"a.bin",50)],&outcome(ScanMode::Incremental,20)).unwrap();store.mark_verification(a,"verified",Some(a_post)).unwrap();
         let b=store.publish("C:\\",&[file(30,"a.bin",150)],&outcome(ScanMode::Incremental,30)).unwrap();
         if delete_post {store.delete_scans(&[a_post]).unwrap();}drop(store);
-        let db=rusqlite::Connection::open(&path).unwrap();db.execute_batch("ALTER TABLE scans DROP COLUMN comparison_from;DROP TABLE scan_baselines;PRAGMA user_version=9;").unwrap();drop(db);
+        let db=rusqlite::Connection::open(&path).unwrap();common::text_history(&db);db.execute_batch("ALTER TABLE scans DROP COLUMN comparison_from;DROP TABLE scan_baselines;PRAGMA user_version=9;").unwrap();drop(db);
         let store=Store::open(&path).unwrap();assert_eq!(store.default_interval(&store.reports().unwrap()).unwrap(),if delete_post {None} else {Some((a_post,b))});
     }
 }
