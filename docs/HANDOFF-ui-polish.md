@@ -1,5 +1,11 @@
 # UI polish shutdown handoff
 
+Historical checkpoint: [PR #1](https://github.com/BW1145/VolumeTrail/pull/1) is now merged
+and [v0.3.0](https://github.com/BW1145/VolumeTrail/releases/tag/v0.3.0) is published.
+Use the [README](../README.md) for current instructions. The branch restrictions
+and continuation steps below describe the pre-release checkpoint, not a request
+to rebuild or republish the existing release.
+
 Branch: `codex/overview-cleanup`, repository `BW1145/VolumeTrail`.
 This checkpoint preserves the four changes requested after independent visual review.
 Do not merge main, publish a Release, update the installed app, register a login task,

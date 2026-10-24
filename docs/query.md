@@ -1,9 +1,14 @@
 # Querying VolumeTrail
 
 Run commands with `VolumeTrail-cli.exe` from the portable folder. Query commands
-use the existing SQLite index; they do not start a scan or need elevation.
+use the existing SQLite index; they do not start a scan, delete files or need elevation.
+For v0.3.1 capability discovery, rule management, preview/confirmation and cleanup
+results, see [the automation interface](automation.md). On first use or after an
+upgrade, open the GUI once to initialize/migrate the database; space queries need
+an existing scan. Keep the complete `data/` beside the executables.
 
 ```powershell
+.\VolumeTrail-cli.exe query overview --drive C --json
 .\VolumeTrail-cli.exe query summary --drive C --limit 20
 .\VolumeTrail-cli.exe query growth --drive C --from 6 --to 7 --depth 5 --json
 .\VolumeTrail-cli.exe query folder --drive C --path 'C:\Users\Example\AppData\Local' --from 6 --to 7 --json
@@ -11,12 +16,21 @@ use the existing SQLite index; they do not start a scan or need elevation.
 .\VolumeTrail-cli.exe query largest --drive C --kind files --offset 50 --limit 50
 ```
 
-`summary` lists scan points newest first. `growth` uses the two latest points
-when `--from` and `--to` are omitted. `--path` narrows growth to a folder and
-defaults to its immediate child level. `folder` shows the current index; with
-`--from` or `--to`, it also shows the interval's child growth and extension
-distribution. `largest` reads current-index directory or file sizes. Limits
-range from 1 to 5000; the UI uses pages of 50 or 100.
+`overview` shares the GUI overview service; its index, comparison interval and
+cleanup summary semantics are described in [automation.md](automation.md#查询).
+`summary` lists scan points newest first. Replace sample `--from` / `--to` IDs
+with existing scan IDs from that volume, earliest first. When both are omitted,
+`growth` uses the saved operation interval: the previous operation's final
+successful point to this operation's pre-cleanup point. It does not use a short
+cleanup-verification interval. If the saved baseline is missing or cleanup is
+unverified, the default comparison fails explicitly; select retained scans or
+scan again rather than substituting zero or an older baseline.
+
+`--path` narrows growth to a folder and defaults to its immediate child level.
+`folder` shows the current index and, when an explicit or valid default interval
+is available, child growth and extension distribution; otherwise `comparison`
+is null. `largest` reads current-index directory or file sizes. Limits range
+from 1 to 5000; the UI uses pages of 50 or 100.
 
 JSON sizes are bytes. `allocated_delta_bytes` is signed: positive means growth,
 negative means release. `moved_delta_bytes` is the signed portion attributable
