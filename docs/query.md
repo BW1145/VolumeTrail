@@ -32,11 +32,16 @@ directory movement. Legacy extension estimates require retained per-file details
 and can therefore have shorter coverage than directory totals.
 
 Starting with 0.2.2, extension totals are stored as directory/type aggregates,
-including file and directory moves. These survive per-file detail cleanup and
-count toward the history budget. `extension_intervals` and
+including file and directory moves. These survive explicit per-file detail cleanup.
+`extension_intervals` and
 `complete_extension_intervals` describe their coverage. Legacy per-file estimates
 remain available where retained, but are explicitly incomplete for moves.
 Directory path filters compare ASCII case insensitively, matching folder lookup.
+
+Starting with 0.3.1, older per-file details are losslessly compressed. Application
+queries transparently read both live and compressed rows. External SQL readers
+must decode `change_archives` as described in [storage.md](storage.md); querying
+only `changes` covers the live rows. Automatic maintenance retains all history.
 
 Growth results include an `unresolved` summary even when pagination excludes its
 row. `[unresolved]` represents changes whose parent paths could not be resolved;

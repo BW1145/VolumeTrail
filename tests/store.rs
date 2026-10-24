@@ -108,10 +108,11 @@ fn extension_history_survives_detail_cleanup_and_deleted_intermediate_points() {
     let next=store.publish("C:\\", &[file(30,"a.bin",28)], &outcome(ScanMode::Incremental,40)).unwrap();
     assert_eq!(store.extensions_between_path("volume-A",first,next,"C:\\").unwrap().items,
         vec![(".bin".into(),18,3)]);
-    store.prune(1).unwrap();
+    let saved = store.extensions_between_path("volume-A",first,next,"C:\\").unwrap();
+    store.compact_history().unwrap();
     let types=store.extensions_between_path("volume-A",first,next,"C:\\").unwrap();
-    assert!(types.items.is_empty());
-    assert_eq!(types.complete_intervals,0);
+    assert_eq!(types.items,saved.items);
+    assert_eq!(types.complete_intervals,saved.complete_intervals);
 }
 
 #[test]
@@ -340,22 +341,24 @@ fn moving_directory_rebuilds_ancestor_totals() {
 }
 
 #[test]
-fn pruning_keeps_current_index_and_space_timeline() {
+fn compaction_keeps_all_details_summaries_and_current_index() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(&dir.path().join("history.db")).unwrap();
     store.publish("C:\\", &[file(10, "file", 100)], &outcome(ScanMode::Full, 50)).unwrap();
     store.publish("C:\\", &[file(10, "file", 400)], &outcome(ScanMode::Incremental, 80)).unwrap();
-    assert_eq!(store.scan_count("C:\\").unwrap(), 2);
+    store.publish("C:\\", &[file(10, "file", 500)], &outcome(ScanMode::Incremental, 100)).unwrap();
+    assert_eq!(store.scan_count("C:\\").unwrap(), 3);
     assert_eq!(store.scan_count("D:\\").unwrap(), 0);
-    let remaining = store.prune(1).unwrap();
+    let remaining = store.compact_history().unwrap();
     assert!(remaining > 1);
-    assert_eq!(store.reports().unwrap().len(), 2);
-    assert_eq!(store.scan_count("C:\\").unwrap(), 2);
-    assert!(store.reports().unwrap().iter().all(|report| !report.details && report.aggregate == 0));
-    assert_eq!(store.totals("volume-A").unwrap(), (400, 400));
+    assert_eq!(store.reports().unwrap().len(), 3);
+    assert_eq!(store.scan_count("C:\\").unwrap(), 3);
+    assert!(store.reports().unwrap().iter().all(|report| report.details && report.aggregate == 2));
+    assert_eq!(store.changes_count("volume-A",0,3,None).unwrap(),2);
+    assert_eq!(store.totals("volume-A").unwrap(), (500, 500));
     let current = store.index_state("volume-A").unwrap().unwrap();
-    assert_eq!((current.0, current.1, current.2), (400, 1_000_000, 800_000));
-    assert_eq!(store.checkpoint("C:\\").unwrap().unwrap().next_usn, 80);
+    assert_eq!((current.0, current.1, current.2), (500, 1_000_000, 800_000));
+    assert_eq!(store.checkpoint("C:\\").unwrap().unwrap().next_usn, 100);
 }
 
 #[test]
@@ -378,7 +381,7 @@ fn deleting_selected_reports_keeps_the_incremental_index() {
 }
 
 #[test]
-fn pruning_releases_free_database_pages() {
+fn compaction_releases_free_database_pages() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("history.db");
     let mut store = Store::open(&path).unwrap();
@@ -388,7 +391,7 @@ fn pruning_releases_free_database_pages() {
     }
     let before = std::fs::metadata(&path).unwrap().len();
     assert!(before > 8 * 1024 * 1024);
-    let after = store.prune(u64::MAX).unwrap();
+    let after = store.compact_history().unwrap();
     assert!(after < before / 2, "database stayed at {after} bytes after pruning {before} bytes");
 }
 
@@ -624,7 +627,7 @@ fn folder_breakdown_includes_direct_files_children_and_deleted_paths() {
 }
 
 #[test]
-fn history_budget_excludes_current_index_timeline_and_migration_backups() {
+fn history_storage_separates_current_index_timeline_and_migration_backups() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("history.db");
     let mut store = Store::open(&path).unwrap();
@@ -637,14 +640,14 @@ fn history_budget_excludes_current_index_timeline_and_migration_backups() {
     store.save_performance(scan, &performance).unwrap();
     std::fs::write(dir.path().join("history-before-v2-test.db"), vec![0u8; 1024]).unwrap();
     let history_budget = store.history_bytes().unwrap();
-    let physical = store.prune(history_budget).unwrap();
+    let physical = store.compact_history().unwrap();
     assert!(physical > history_budget);
     assert!(store.reports().unwrap().iter().all(|report| report.details && report.aggregate == 2));
     let usage = store.storage_usage().unwrap();
     assert_eq!(usage.history_bytes, history_budget);
     assert_eq!(usage.backup_bytes, 1024);
     assert!(usage.index_bytes > 0 && usage.timeline_bytes > 0);
-    store.prune(1).unwrap();
+    store.compact_history().unwrap();
     assert_eq!(store.reports().unwrap()[0].performance.as_ref().unwrap().counters.journal_records, 100);
     assert_eq!(store.totals("volume-A").unwrap(), (200, 200));
     drop(store);
@@ -663,10 +666,11 @@ fn production_increment_replay_on_isolated_copy_when_requested() {
     let mut store = Store::open(&copy).unwrap();
     let mut cp = store.checkpoint("C:\\").unwrap().unwrap();
     let db = rusqlite::Connection::open_with_flags(&copy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-    let mut stmt = db.prepare("SELECT payload FROM nodes WHERE volume=? AND is_dir=0 LIMIT 14000").unwrap();
-    let entries = stmt.query_map([&cp.volume_id], |r| r.get::<_, String>(0)).unwrap()
+    let count=std::env::var("DISKHISTORY_BENCH_RECORDS").ok().and_then(|n|n.parse::<i64>().ok()).unwrap_or(14000);
+    let mut stmt = db.prepare("SELECT id FROM nodes WHERE volume=? AND is_dir=0 LIMIT ?").unwrap();
+    let mut entries = stmt.query_map(rusqlite::params![cp.volume_id,count], |r| r.get::<_, i64>(0)).unwrap()
         .map(|entry| {
-            let mut entry: Entry = serde_json::from_str(&entry.unwrap()).unwrap();
+            let mut entry = store.indexed_entry(&cp.volume_id,entry.unwrap() as u64).unwrap().unwrap();
             entry.modified += 1;
             entry.logical += 4096;
             entry.allocated += 4096;
@@ -675,6 +679,10 @@ fn production_increment_replay_on_isolated_copy_when_requested() {
     drop(stmt);
     drop(db);
     assert!(entries.len() > 10000);
+    if let Ok(id)=std::env::var("DISKHISTORY_BENCH_DIRECTORY_ID") {
+        let mut entry=store.indexed_entry(&cp.volume_id,id.parse().unwrap()).unwrap().unwrap();
+        assert!(entry.is_dir);entry.name.push_str("-benchmark");entries.push(Mutation::Upsert(entry));
+    }
     cp.next_usn += 1;
     let mut sample = outcome(ScanMode::Incremental, cp.next_usn);
     sample.checkpoint = cp;
@@ -682,7 +690,7 @@ fn production_increment_replay_on_isolated_copy_when_requested() {
     for entry in entries { store.stage(entry).unwrap(); }
     let start = std::time::Instant::now();
     store.commit_stage("C:\\", &sample).unwrap();
-    println!("isolated commit of 14000 resized records: {:.2}s", start.elapsed().as_secs_f64());
+    println!("isolated commit of {count} resized records plus optional directory rename: {:.2}s; phases {:?}", start.elapsed().as_secs_f64(),store.commit_timings);
 }
 
 #[test]

@@ -3,7 +3,8 @@ use serde_json::{Value,json};
 use volumetrail::{cleanup,model::*,store::Store};
 
 fn invoke(exe:&Path,args:&[&str],expected:i32)->Value {
-    let output=Command::new(exe).args(args).output().unwrap();
+    let output=Command::new(exe).args(args).output()
+        .unwrap_or_else(|error| panic!("Launch {exe:?} with {args:?}: {error}"));
     assert_eq!(output.status.code(),Some(expected),"args={args:?}\nstdout={}\nstderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
     let text=String::from_utf8(output.stdout).unwrap();
     let value:Value=serde_json::from_str(&text).unwrap_or_else(|e|panic!("Single JSON contract: {e}: {text}"));

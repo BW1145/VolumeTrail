@@ -27,7 +27,7 @@ fn main()->Result<()> {
                 store.recover_cleanup_runs()?;store.reconcile_cleanup_after_scan("bench-volume",id)?;
                 assert!(store.cleanup_rules()?.is_empty());store.prune_cleanup(chrono::Utc::now().timestamp())?;
             }
-            store.prune(512*1024*1024)?;samples.push(begin.elapsed().as_micros() as u64);
+            store.compact_history()?;samples.push(begin.elapsed().as_micros() as u64);
         }
         println!("{}",serde_json::json!({"mode":mode,"indexed_files":20000,"incremental_commits":30,"elapsed_ms":start.elapsed().as_secs_f64()*1000.0,
             "samples_us":samples,"peak_working_set_bytes":peak(),"database_files_before_bytes":before,"database_files_after_bytes":bytes(&data),"database_delta_bytes":i128::from(bytes(&data))-i128::from(before),"database_logical_delta_bytes":i128::from(logical(&data))-i128::from(logical_before),"raw_usn_scan":false}));

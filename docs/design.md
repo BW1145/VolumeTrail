@@ -18,9 +18,9 @@ live in data/ beside the executable. No file contents are backed up.
 - Changes distinguish creation, deletion, growth, shrinkage and rename/move.
 - Keep logical size and allocated bytes distinct; count hard-linked data once.
 - Show unaccounted volume usage instead of forcing file totals to match volume totals.
-- History retention uses a configurable 512 MiB default database budget. Scan
-  timepoints and the current index remain; file detail and then folder aggregates
-  are removed oldest first when the budget is exceeded.
+- History retention uses lossless compression for older file details. Scan
+  timepoints, file details and folder/type aggregates persist until explicitly
+  removed by the user. The current index avoids duplicating fields in JSON.
 - UI includes overview and long-term trend filters, folder browser and largest
   items, change history and drilldown, settings, manual scan, cancellation and
   opening/selecting the target in Windows Explorer.

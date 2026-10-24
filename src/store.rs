@@ -5,6 +5,8 @@ use serde::Serialize;
 use std::{collections::{HashMap, HashSet}, fs, path::{Path, PathBuf}, time::{Duration, Instant}};
 mod operations;
 mod cleanup;
+mod compact;
+mod subtree;
 
 pub struct Store {
     db: Connection,
@@ -12,6 +14,7 @@ pub struct Store {
     staging: bool,
     verification_context: Option<(Option<i64>,String)>,
     cancel_path: Option<PathBuf>,
+    scan_work: Option<(PathBuf,String)>,
     pub commit_timings: CommitTimings,
 }
 
@@ -109,7 +112,8 @@ impl Store {
         db.busy_timeout(Duration::from_secs(3))?;
         ensure!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? >= 2,
             "History database needs a one-time upgrade; open VolumeTrail first");
-        Ok(Self { db, path: path.to_path_buf(), staging: false, verification_context: None, cancel_path: None, commit_timings: CommitTimings::default() })
+        compact::configure(&db)?;
+        Ok(Self { db, path: path.to_path_buf(), staging: false, verification_context: None, cancel_path: None, scan_work: None, commit_timings: CommitTimings::default() })
     }
 
     pub fn data_version(&self) -> Result<i64> {
@@ -248,10 +252,30 @@ impl Store {
         Self::migrate_cleanup(&db)?;
         Self::migrate_baselines(&db)?;
         Self::migrate_pending_baselines(&db)?;
-        Ok(Self { db, path: path.to_path_buf(), staging: false, verification_context: None, cancel_path: None, commit_timings: CommitTimings::default() })
+        Self::migrate_compact(&db)?;
+        if db.query_row("PRAGMA user_version", [], |r| r.get::<_,i64>(0))? < 13 {
+            let exists=db.prepare("PRAGMA table_info(scans)")?.query_map([],|r|r.get::<_,String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?.iter().any(|column|column=="task_id");
+            let tx=db.unchecked_transaction()?;
+            if !exists {tx.execute("ALTER TABLE scans ADD COLUMN task_id TEXT",[])?;}
+            tx.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS scans_task ON scans(task_id) WHERE task_id IS NOT NULL;
+                PRAGMA user_version=13;")?;tx.commit()?;
+        }
+        compact::configure(&db)?;
+        Ok(Self { db, path: path.to_path_buf(), staging: false, verification_context: None, cancel_path: None, scan_work: None, commit_timings: CommitTimings::default() })
     }
 
     pub fn set_cancel_path(&mut self, path: PathBuf) { self.cancel_path = Some(path); }
+
+    pub(crate) fn scan_context(&self)->Option<(Option<i64>,String)> {self.verification_context.clone()}
+    pub(crate) fn set_scan_work(&mut self,path:PathBuf,task:String) {self.scan_work=Some((path,task));}
+    pub(crate) fn clear_scan_work(&mut self) {self.scan_work=None;}
+    pub(crate) fn scan_base_id(&self,volume:&str)->Result<i64> {
+        Ok(self.db.query_row("SELECT COALESCE(MAX(id),0) FROM scans WHERE volume=?",[volume],|r|r.get(0))?)
+    }
+    pub(crate) fn published_task(&self,task:&str)->Result<Option<i64>> {
+        Ok(self.db.query_row("SELECT id FROM scans WHERE task_id=?",[task],|r|r.get(0)).optional()?)
+    }
 
     pub fn database_drive(&self) -> Option<char> {
         self.path.to_str()?.chars().next().filter(|letter| letter.is_ascii_alphabetic())
@@ -278,10 +302,8 @@ impl Store {
     }
 
     pub fn indexed_entry(&self, volume: &str, id: u64) -> Result<Option<Entry>> {
-        let payload: Option<String> = self.db.query_row(
-            "SELECT payload FROM nodes WHERE volume=? AND id=?", params![volume, id as i64],
-            |r| r.get(0)).optional()?;
-        payload.map(|json| serde_json::from_str(&json).map_err(Into::into)).transpose()
+        Ok(self.db.query_row(&format!("SELECT {} FROM nodes WHERE volume=? AND id=?", compact::ENTRY_COLUMNS),
+            params![volume, id as i64], compact::read_entry).optional()?)
     }
 
     pub fn missing_parent_ids(&self, volume: &str, full: bool) -> Result<Vec<u64>> {
@@ -322,7 +344,7 @@ impl Store {
         if let Some(path) = self.cancel_path.clone() {
             self.db.progress_handler(10000, Some(move || path.exists()));
         }
-        if let Err(error) = self.db.execute_batch("BEGIN IMMEDIATE; DELETE FROM staging;") {
+        if let Err(error) = self.db.execute_batch("PRAGMA synchronous=FULL; BEGIN IMMEDIATE; DELETE FROM staging;") {
             self.stop_progress_handler();
             let _ = self.db.execute_batch("ROLLBACK");
             return Err(error.into());
@@ -376,6 +398,11 @@ impl Store {
                 }
                 if let Err(error) = self.check_cancel() { self.discard_stage()?; return Err(error); }
                 self.stop_progress_handler();
+                if let Some((_,task))=&self.scan_work {
+                    if let Err(error)=self.db.execute("UPDATE scans SET task_id=? WHERE id=?",params![task,id]) {
+                        self.discard_stage()?;return Err(error.into());
+                    }
+                }
                 if let Err(error) = self.db.execute("UPDATE scans SET finished=? WHERE id=?",
                     params![chrono::Local::now().to_rfc3339(), id]) {
                     self.discard_stage()?;
@@ -455,13 +482,14 @@ impl Store {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?.unwrap_or_default();
         let mut volume_delta = (0i128, 0i128, 0i128);
         if outcome.mode == ScanMode::Full {
-            let mut absent = self.db.prepare("SELECT n.payload FROM nodes n LEFT JOIN staging s ON s.id=n.id WHERE n.volume=? AND s.payload IS NULL")?;
+            let columns = compact::ENTRY_COLUMNS.split(',').map(|name| format!("n.{name}")).collect::<Vec<_>>().join(",");
+            let mut absent = self.db.prepare(&format!("SELECT {columns} FROM nodes n LEFT JOIN staging s ON s.id=n.id WHERE n.volume=? AND s.payload IS NULL"))?;
             let mut rows = absent.query([&cp.volume_id])?;
             let mut index = 0;
             while let Some(row) = rows.next()? {
                 if index % 512 == 0 { self.check_cancel()?; control()?; }
                 index += 1;
-                let old: Entry = serde_json::from_str(&row.get::<_, String>(0)?)?;
+                let old = compact::read_entry(row)?;
                 if !old.is_dir {
                     volume_delta.0 -= i128::from(old.logical);
                     volume_delta.1 -= i128::from(old.allocated);
@@ -478,16 +506,16 @@ impl Store {
         }
         let mut rows = staged.query([])?;
         let mut index = 0;
+        let old_query = format!("SELECT {} FROM nodes WHERE volume=? AND id=?", compact::ENTRY_COLUMNS);
         while let Some(row) = rows.next()? {
             if index % 512 == 0 { self.check_cancel()?; control()?; }
             index += 1;
             let id: i64 = row.get(0)?;
-            let old: Option<String> = self.db.prepare_cached("SELECT payload FROM nodes WHERE volume=? AND id=?")?
-                .query_row(params![cp.volume_id, id], |r| r.get(0)).optional()?;
+            let old = self.db.prepare_cached(&old_query)?
+                .query_row(params![cp.volume_id, id], compact::read_entry).optional()?;
             let payload: Option<String> = row.get(1)?;
-            if old == payload && changed_dirs.is_empty() { continue; }
-            let old: Option<Entry> = old.map(|s| serde_json::from_str(&s)).transpose()?;
             let new: Option<Entry> = payload.as_ref().map(|s| serde_json::from_str(s)).transpose()?;
+            if old == new && changed_dirs.is_empty() { continue; }
             if had_baseline {
                 self.record_change(scan, root, cp.root_id, old.as_ref(), new.as_ref(), &old_dirs, &new_dirs)?;
                 extension_change(&mut extensions, root, cp.root_id, old.as_ref(), new.as_ref(), &old_dirs, &new_dirs);
@@ -513,7 +541,7 @@ impl Store {
             }
             if let Some(e) = new {
                 self.db.prepare_cached("INSERT INTO nodes VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(volume,id) DO UPDATE SET parent=excluded.parent,name=excluded.name,is_dir=excluded.is_dir,logical=excluded.logical,allocated=excluded.allocated,payload=excluded.payload")?
-                    .execute(params![cp.volume_id, id, e.parent as i64, e.name, e.is_dir, e.logical as i64, e.allocated as i64, payload])?;
+                    .execute(params![cp.volume_id, id, e.parent as i64, e.name, e.is_dir, e.logical as i64, e.allocated as i64, compact::entry_payload(&e)?])?;
             } else { self.db.prepare_cached("DELETE FROM nodes WHERE volume=? AND id=?")?.execute(params![cp.volume_id, id])?; }
         }
         let logical = i64::try_from(i128::from(old_total.0) + volume_delta.0)?;
@@ -575,34 +603,6 @@ impl Store {
         self.db.execute("DELETE FROM carry_folders WHERE volume=?", [&cp.volume_id])?;
         self.commit_timings.history_ms = history_started.elapsed().as_millis() as u64;
         Ok(scan)
-    }
-
-    fn unchanged_subtree_changes(&self, volume: &str, root: &str, root_id: u64,
-        dirs: &Directories, other_dirs: &Directories, sign: i128,
-        result: &mut ExtensionDeltas, growth: &mut GrowthDeltas,
-        control: &mut dyn FnMut() -> Result<()>) -> Result<()> {
-        let mut stmt = self.db.prepare("WITH RECURSIVE subtree(id) AS (
-            SELECT id FROM changed_directories
-            UNION SELECT n.id FROM nodes n JOIN subtree p ON n.parent=p.id WHERE n.volume=? AND n.is_dir=1 AND n.id<>n.parent)
-            SELECT n.id,n.parent,n.name,n.allocated FROM nodes n JOIN subtree p ON n.parent=p.id
-            WHERE n.volume=? AND n.is_dir=0 AND n.id NOT IN (SELECT id FROM staging)")?;
-        let mut rows = stmt.query(params![volume, volume])?;
-        let mut count = 0;
-        while let Some(row) = rows.next()? {
-            if count % 512 == 0 { self.check_cancel()?; control()?; }
-            count += 1;
-            let entry = Entry { id: row.get::<_, i64>(0)? as u64, parent: row.get::<_, i64>(1)? as u64,
-                name: row.get(2)?, allocated: row.get::<_, i64>(3)? as u64, is_dir: false,
-                logical: 0, modified: 0, attributes: 0, links: vec![] };
-            let path = entry_path(root, root_id, &entry, dirs);
-            if path == entry_path(root, root_id, &entry, other_dirs) { continue; }
-            extension_delta(result, root, root_id, Some(&entry), dirs, sign);
-            if let Some(parent) = folder_parent(&path) {
-                let delta = sign * i128::from(entry.allocated);
-                growth_entry(growth, parent, delta, delta, 1);
-            }
-        }
-        Ok(())
     }
 
     fn refresh_folder_totals(&self, volume: &str, affected: HashSet<u64>, dirs: &Directories,
@@ -706,7 +706,7 @@ impl Store {
     }
 
     pub fn changes(&self, scan: i64) -> Result<Vec<Change>> {
-        let mut stmt = self.db.prepare("SELECT old_path,new_path,logical_delta,allocated_delta,kind FROM changes WHERE scan=? ORDER BY ABS(allocated_delta) DESC,ABS(logical_delta) DESC LIMIT 2000")?;
+        let mut stmt = self.db.prepare("SELECT old_path,new_path,logical_delta,allocated_delta,kind FROM change_history WHERE scan=? ORDER BY ABS(allocated_delta) DESC,ABS(logical_delta) DESC,seq LIMIT 2000")?;
         Ok(stmt.query_map([scan], |r| Ok(Change { old_path: r.get(0)?, new_path: r.get(1)?, logical_delta: r.get(2)?, allocated_delta: r.get(3)?, kind: r.get(4)? }))?.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -718,9 +718,9 @@ impl Store {
         limit: u64, offset: u64) -> Result<Vec<Change>> {
         let mut stmt = self.db.prepare(
             "SELECT c.old_path,c.new_path,c.logical_delta,c.allocated_delta,c.kind
-             FROM changes c JOIN scans s ON s.id=c.scan
+             FROM change_history c JOIN scans s ON s.id=c.scan
              WHERE s.volume=? AND c.scan>? AND c.scan<=?
-             ORDER BY ABS(c.allocated_delta) DESC,ABS(c.logical_delta) DESC LIMIT ? OFFSET ?")?;
+             ORDER BY ABS(c.allocated_delta) DESC,ABS(c.logical_delta) DESC,c.scan,c.seq LIMIT ? OFFSET ?")?;
         Ok(stmt.query_map(params![volume, from, to, limit.min(5000) as i64, offset as i64], |r| Ok(Change {
             old_path: r.get(0)?, new_path: r.get(1)?, logical_delta: r.get(2)?,
             allocated_delta: r.get(3)?, kind: r.get(4)?,
@@ -731,12 +731,12 @@ impl Store {
         let count: i64 = if let Some(path) = path {
             let path = normalize_folder_path(path)?;
             let prefix = folder_prefix(&path);
-            self.db.query_row("SELECT COUNT(*) FROM changes c JOIN scans s ON s.id=c.scan
+            self.db.query_row("SELECT COUNT(*) FROM change_history c JOIN scans s ON s.id=c.scan
                 WHERE s.volume=? AND c.scan>? AND c.scan<=? AND
                 (substr(c.old_path,1,length(?))=? COLLATE NOCASE OR substr(c.new_path,1,length(?))=? COLLATE NOCASE)",
                 params![volume, from, to, prefix, prefix, prefix, prefix], |r| r.get(0))?
         } else {
-            self.db.query_row("SELECT COUNT(*) FROM changes c JOIN scans s ON s.id=c.scan
+            self.db.query_row("SELECT COALESCE(SUM(c.entries),0) FROM change_counts c JOIN scans s ON s.id=c.scan
                 WHERE s.volume=? AND c.scan>? AND c.scan<=?",
                 params![volume, from, to], |r| r.get(0))?
         };
@@ -749,10 +749,10 @@ impl Store {
         let prefix = folder_prefix(&path);
         let mut stmt = self.db.prepare(
             "SELECT c.old_path,c.new_path,c.logical_delta,c.allocated_delta,c.kind
-             FROM changes c JOIN scans s ON s.id=c.scan
+             FROM change_history c JOIN scans s ON s.id=c.scan
              WHERE s.volume=? AND c.scan>? AND c.scan<=? AND
              (substr(c.old_path,1,length(?))=? COLLATE NOCASE OR substr(c.new_path,1,length(?))=? COLLATE NOCASE)
-             ORDER BY ABS(c.allocated_delta) DESC,ABS(c.logical_delta) DESC LIMIT ? OFFSET ?")?;
+             ORDER BY ABS(c.allocated_delta) DESC,ABS(c.logical_delta) DESC,c.scan,c.seq LIMIT ? OFFSET ?")?;
         Ok(stmt.query_map(params![volume, from, to, prefix, prefix, prefix, prefix,
             limit.min(5000) as i64, offset as i64], |r| Ok(Change {
                 old_path: r.get(0)?, new_path: r.get(1)?, logical_delta: r.get(2)?,
@@ -783,7 +783,7 @@ impl Store {
         }
         let legacy = if version >= 7 { " AND s.extensions_complete=0" } else { "" };
         let mut stmt = self.db.prepare(&format!(
-            "SELECT c.old_path,c.new_path,c.allocated_delta FROM changes c JOIN scans s ON s.id=c.scan
+            "SELECT c.old_path,c.new_path,c.allocated_delta FROM change_history c JOIN scans s ON s.id=c.scan
              WHERE s.volume=? AND c.scan>? AND c.scan<=? AND c.allocated_delta<>0 AND
              (substr(c.old_path,1,length(?))=? COLLATE NOCASE OR substr(c.new_path,1,length(?))=? COLLATE NOCASE){legacy}"))?;
         let mut rows = stmt.query(params![volume, from, to, prefix, prefix, prefix, prefix])?;
@@ -898,6 +898,7 @@ impl Store {
         for id in ids {
             cleared += tx.execute("UPDATE scans SET details=0 WHERE id=? AND details<>0", [id])?;
             tx.execute("DELETE FROM changes WHERE scan=?", [id])?;
+            tx.execute("DELETE FROM change_archives WHERE scan=?", [id])?;
         }
         tx.commit()?;
         self.reclaim_free_pages()?;
@@ -1027,31 +1028,6 @@ impl Store {
         Ok(format!("[unresolved #{id}]"))
     }
 
-    pub fn prune(&mut self, budget: u64) -> Result<u64> {
-        ensure!(!self.staging, "Cannot prune during a scan");
-        loop {
-            self.check_cancel()?;
-            self.reclaim_free_pages()?;
-            if self.history_bytes()? <= budget { break; }
-            let oldest: Option<i64> = self.db.query_row("SELECT MIN(id) FROM scans WHERE details<>0", [], |r| r.get(0))?;
-            if let Some(id) = oldest {
-                self.db.execute("DELETE FROM changes WHERE scan=?", [id])?;
-                self.db.execute("UPDATE scans SET details=0 WHERE id=?", [id])?;
-                continue;
-            }
-            let oldest: Option<i64> = self.db.query_row("SELECT MIN(id) FROM scans WHERE aggregate<>0", [], |r| r.get(0))?;
-            if let Some(id) = oldest {
-                self.db.execute("DELETE FROM folder_changes WHERE scan=?", [id])?;
-                self.db.execute("DELETE FROM extension_changes WHERE scan=?", [id])?;
-                self.db.execute("UPDATE scans SET extensions_complete=0 WHERE id=?", [id])?;
-                self.db.execute("UPDATE scans SET aggregate=0 WHERE id=?", [id])?;
-                continue;
-            }
-            break;
-        }
-        self.used_bytes()
-    }
-
     fn reclaim_free_pages(&self) -> Result<()> {
         self.checkpoint_wal()?;
         let mut stmt = self.db.prepare("PRAGMA incremental_vacuum")?;
@@ -1082,7 +1058,8 @@ impl Store {
                 'carry_folders','sqlite_autoindex_carry_folders_1',
                 'extension_changes','sqlite_autoindex_extension_changes_1',
                 'carry_extensions','sqlite_autoindex_carry_extensions_1',
-                'carry_extension_quality','sqlite_autoindex_carry_extension_quality_1')", [], |row| row.get(0))?)
+                  'carry_extension_quality','sqlite_autoindex_carry_extension_quality_1',
+                  'change_archives','sqlite_autoindex_change_archives_1')", [], |row| row.get(0))?)
     }
 
     pub fn storage_usage(&self) -> Result<StorageUsage> {

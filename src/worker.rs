@@ -126,27 +126,26 @@ pub fn stop_scan(data: &Path, letter: char) -> Result<()> {
     Ok(())
 }
 
-pub fn maintain(letter: char) -> Result<u64> {
+pub fn has_saved_scan(data:&Path,letter:char)->bool {
+    crate::scan_work::path(data,&format!("{}:\\",letter.to_ascii_uppercase())).exists()
+}
+
+pub fn discard_saved_scan(data:&Path,letter:char)->Result<()> {
+    let _lock=global_scan_lock(data)?;
+    crate::scan_work::remove(&crate::scan_work::path(data,&format!("{}:\\",letter.to_ascii_uppercase())))
+}
+
+pub fn maintain(_letter: char) -> Result<u64> {
     let data = data_dir()?;
     let _lock = global_scan_lock(&data)?;
     let mut store = Store::open(&store_path(&data))?;
-    let budget = AppConfig::load(&data)?.budget_bytes();
-    let size = store.prune(budget)?;
-    if store.history_bytes()? <= budget {
-        if let Some(mut status) = read_status(&data, letter) {
-            if status.finished && status.error.is_none() {
-                status.warning = None;
-                write_status(&data, letter, &status)?;
-            }
-        }
-    }
-    Ok(size)
+    store.compact_history()
 }
 
 pub enum HistoryAction {
     ClearDetails(Vec<i64>),
     Delete(Vec<i64>),
-    Prune(u64),
+    Compact,
 }
 
 pub fn edit_history(data: &Path, action: HistoryAction) -> Result<String> {
@@ -161,23 +160,21 @@ pub fn edit_history(data: &Path, action: HistoryAction) -> Result<String> {
             let count = store.delete_scans(&ids)?;
             Ok(format!("已删除 {count} 条扫描记录"))
         }
-        HistoryAction::Prune(budget) => {
-            store.prune(budget)?;
-            Ok(format!("整理完成，历史明细和目录汇总占用 {} MiB", store.history_bytes()? / 1024 / 1024))
+        HistoryAction::Compact => {
+            store.compact_history()?;
+            Ok(format!("无损压缩完成，历史明细和目录汇总占用 {} MiB，全部记录保留", store.history_bytes()? / 1024 / 1024))
         }
     }
 }
 
 pub fn run_scan(letter: char) -> Result<()> {
     let data = data_dir()?;
-    let budget = AppConfig::load(&data)?.budget_bytes();
-    run_scan_configured(letter, &data, budget)
+    run_scan_configured(letter, &data)
 }
 
 pub fn run_auto() -> Result<()> {
     let data = data_dir()?;
     let config = AppConfig::load(&data)?;
-    let budget = config.budget_bytes();
     let _global_lock = global_scan_lock(&data)?;
     let mut failures = Vec::new();
     for letter in config.drives {
@@ -189,7 +186,7 @@ pub fn run_auto() -> Result<()> {
             })?;
             continue;
         }
-        if let Err(error) = run_scan_locked(letter, &data, budget, true) {
+        if let Err(error) = run_scan_locked(letter, &data, true) {
             failures.push(format!("{letter}: {error:#}"));
         }
         if stop_path(&data,letter).exists() {break;} // a cancelled login operation must not clean subsequent volumes
@@ -198,12 +195,12 @@ pub fn run_auto() -> Result<()> {
     Ok(())
 }
 
-fn run_scan_configured(letter: char, data: &Path, budget: u64) -> Result<()> {
+fn run_scan_configured(letter: char, data: &Path) -> Result<()> {
     let _global_lock = global_scan_lock(data)?;
-    run_scan_locked(letter, data, budget, false)
+    run_scan_locked(letter, data, false)
 }
 
-fn run_scan_locked(letter: char, data: &Path, budget: u64, automatic: bool) -> Result<()> {
+fn run_scan_locked(letter: char, data: &Path, automatic: bool) -> Result<()> {
     let started = Instant::now();
     let cpu_started = process_cpu_ms();
     ensure!(letter.is_ascii_alphabetic(), "Invalid drive letter");
@@ -268,14 +265,8 @@ fn run_scan_locked(letter: char, data: &Path, budget: u64, automatic: bool) -> R
         eprintln!("{} 整理历史", chrono::Local::now().format("%H:%M:%S"));
         write_status(data, letter, &status)?;
         let maintenance_started = Instant::now();
-        match store.prune(budget).and_then(|_| store.history_bytes()) {
-            Ok(size) if size > budget => {
-                append_warning(&mut status.warning, "历史汇总占用已超过预算".into());
-            }
-            Err(error) => {
-                append_warning(&mut status.warning, format!("历史整理失败：{error:#}"));
-            }
-            _ => {}
+        if let Err(error) = store.compact_history() {
+            append_warning(&mut status.warning, format!("历史压缩未完成，原明细继续保留：{error:#}"));
         }
         status.maintenance_ms = Some(maintenance_started.elapsed().as_millis() as u64);
         Ok((final_report, store))
@@ -303,6 +294,10 @@ fn run_scan_locked(letter: char, data: &Path, budget: u64, automatic: bool) -> R
     status.performance = Some(performance);
     match &result {
         Ok((id, _)) => { status.phase = "完成".into(); status.report_id = Some(*id); }
+        Err(_) if stop.exists() && has_saved_scan(data,letter) => {
+            status.phase="进度已保存".into();
+            append_warning(&mut status.warning,"下次扫描将继续已保存的读取和目录统计进度".into());
+        }
         Err(error) => { status.phase = "失败".into(); status.error = Some(format!("{error:#}")); }
     }
     write_status(data, letter, &status)?;

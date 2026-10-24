@@ -21,8 +21,8 @@ impl VolumeTrailApp {
             if ui.add_enabled(can_edit,egui::Button::new(format!("删除所选 ({})",self.history_selection.len()))).clicked() {
                 self.start_history_job(worker::HistoryAction::Delete(self.history_selection.iter().copied().collect()));
             }
-            if ui.add_enabled(!self.any_running && self.history_rx.is_none(),egui::Button::new("按预算整理")).clicked() {
-                self.start_history_job(worker::HistoryAction::Prune(self.saved_config.budget_bytes()));
+            if ui.add_enabled(!self.any_running && self.history_rx.is_none(),egui::Button::new("无损压缩历史")).clicked() {
+                self.start_history_job(worker::HistoryAction::Compact);
             }
         });
         ui.label(RichText::new("清理后核验归入原扫描操作；展开观测时间可查看或选择各真实记录。").color(MUTED));

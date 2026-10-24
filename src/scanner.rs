@@ -86,9 +86,20 @@ impl Volume {
     where
         F: FnMut(UsnRecord) -> Result<()>,
     {
-        let mut input = MFT_ENUM_DATA_V0 { StartFileReferenceNumber: 0, LowUsn: 0, HighUsn: high_usn };
-        let mut buffer = vec![0u8; BUFFER_SIZE];
         let mut seen = 0u64;
+        self.enumerate_batches(0,high_usn,|records,_next| {
+            for record in records {
+                consume(record)?;seen+=1;
+                if max_records.is_some_and(|limit|seen>=limit) {return Ok(false);}
+            }
+            Ok(true)
+        })
+    }
+
+    fn enumerate_batches<F>(&self,cursor:u64,high_usn:i64,mut consume:F)->Result<()>
+    where F:FnMut(Vec<UsnRecord>,u64)->Result<bool> {
+        let mut input=MFT_ENUM_DATA_V0 {StartFileReferenceNumber:cursor,LowUsn:0,HighUsn:high_usn};
+        let mut buffer=vec![0u8;BUFFER_SIZE];
         loop {
             let mut written = 0;
             let result = self.control(
@@ -108,11 +119,7 @@ impl Volume {
             ensure!(bytes.len() >= 8, "Short MFT enumeration response");
             let next = u64::from_le_bytes(bytes[..8].try_into()?);
             ensure!(next > input.StartFileReferenceNumber, "MFT enumeration did not advance");
-            for record in parse_records(&bytes[8..])? {
-                consume(record)?;
-                seen += 1;
-                if max_records.is_some_and(|limit| seen >= limit) { return Ok(()); }
-            }
+            if !consume(parse_records(&bytes[8..])?,next)? {return Ok(());}
             input.StartFileReferenceNumber = next;
         }
         Ok(())
@@ -122,6 +129,13 @@ impl Volume {
     where
         F: FnMut(UsnRecord) -> Result<()>,
     {
+        self.change_batches(start_usn,end_usn,journal_id,|records,_next| {
+            for record in records {consume(record)?;}Ok(())
+        })
+    }
+
+    fn change_batches<F>(&self,start_usn:i64,end_usn:i64,journal_id:u64,mut consume:F)->Result<i64>
+    where F:FnMut(Vec<UsnRecord>,i64)->Result<()> {
         ensure!(end_usn >= start_usn, "USN endpoint precedes scan start");
         let mut input = READ_USN_JOURNAL_DATA_V0 {
             StartUsn: start_usn,
@@ -148,10 +162,11 @@ impl Volume {
             ensure!(next >= input.StartUsn, "USN journal cursor moved backwards");
             if bytes.len() == 8 {
                 ensure!(next >= end_usn, "USN journal stopped before the captured endpoint");
+                consume(Vec::new(),next)?;
                 return Ok(next);
             }
             ensure!(next > input.StartUsn, "USN journal did not advance");
-            for record in parse_records(&bytes[8..])? { consume(record)?; }
+            consume(parse_records(&bytes[8..])?,next)?;
             input.StartUsn = next;
         }
     }
@@ -199,140 +214,173 @@ pub fn scan_volume_with_policy(
     root:&str,store:&mut Store,cancelled:&dyn Fn()->bool,
     progress:&mut dyn FnMut(ScanProgress),counters:&mut ScanCounters,policy:ScanPolicy,
 ) -> Result<i64> {
+    use crate::scan_work::{self,State,Work};
     if cancelled() {anyhow::bail!("Scan cancelled");}
-    let letter = root.chars().next().context("Missing drive letter")?;
-    ensure!(root.len() == 3 && root.as_bytes()[1..] == *b":\\", "Expected a drive root such as C:\\");
-    let volume = Volume::open(letter)?;
-    let mut reader = volume.ntfs_reader()?;
-    let ntfs = Ntfs::new(&mut reader).context("Read NTFS boot sector")?;
-    let root_id = root_id(&ntfs, &mut reader)?;
-    let volume_id = format!("ntfs:{:016x}", ntfs.serial_number());
-    let start = volume.journal()?;
-    let previous = store.checkpoint(root)?;
-    let (mode, full_reason) = scan_mode(previous.as_ref(), &volume_id, root_id, start);
-    enforce_scan_policy(policy,mode)?; // must precede pending reads, load monitoring and begin_stage
-    let mut pending: HashSet<u64> = if mode == ScanMode::Incremental {
-        store.pending(root)?.into_iter().collect()
-    } else { HashSet::new() };
-    let mut load = CpuLoad::new([Some(letter), store.database_drive()])?;
-    progress(ScanProgress {
-        phase: if mode == ScanMode::Full { "MFT" } else { "USN" }.into(),
-        processed: 0,
-        expected: 0,
-    });
-    store.begin_stage()?;
-    let mut processed = 0u64;
-    let run = (|| -> Result<ScanOutcome> {
-        std::thread::sleep(Duration::from_millis(500));
-        let mut phase = if mode == ScanMode::Full { "MFT" } else { "USN" };
-        load.wait_if_busy(cancelled, progress, phase, processed)?;
-        if mode == ScanMode::Full {
-            counters.entry_reads += 1;
-            let root_entry = read_entry(&ntfs, &mut reader, root_id)?.context("Root directory disappeared")?;
-            store.stage(Mutation::Upsert(root_entry))?;
-            volume.enumerate(start.next_usn, None, |record| {
-                if cancelled() { anyhow::bail!("Scan cancelled"); }
-                if record.id != root_id && (record.id & 0x0000_ffff_ffff_ffff) >= 16 {
-                    stage_record(&ntfs, &mut reader, store, &volume_id, record.id, true, &mut pending, &mut counters.entry_reads)?;
-                }
-                processed += 1;
-                if processed % 512 == 0 {
-                    std::thread::yield_now();
-                    load.wait_if_busy(cancelled, progress, phase, processed)?;
-                }
-                if processed % 4096 == 0 {
-                    progress(ScanProgress { phase: "MFT".into(), processed, expected: 0 });
-                }
-                Ok(())
-            })?;
+    let letter=root.chars().next().context("Missing drive letter")?;
+    ensure!(root.len()==3 && root.as_bytes()[1..]==*b":\\","Expected a drive root such as C:\\");
+    let volume=Volume::open(letter)?;
+    let mut reader=volume.ntfs_reader()?;
+    let ntfs=Ntfs::new(&mut reader).context("Read NTFS boot sector")?;
+    let root_id=root_id(&ntfs,&mut reader)?;
+    let volume_id=format!("ntfs:{:016x}",ntfs.serial_number());
+    let start=volume.journal()?;
+    let previous=store.checkpoint(root)?;
+    let base_scan=store.scan_base_id(&volume_id)?;
+    let verification=store.scan_context();
+    let work_path=scan_work::path(store.source_directory().context("Missing data directory")?,root);
+    let mut resume_warning=None;
+    let saved=match Work::load(&work_path) {
+        Ok(saved)=>saved,
+        Err(error)=>{
+            resume_warning=Some(format!("扫描工作文件无法恢复，重新采集：{error:#}"));
+            scan_work::remove(&work_path)?;None
         }
-        reader.invalidate();
-        let endpoint = volume.journal()?;
-        ensure!(endpoint.id == start.id && endpoint.first_usn <= start.next_usn,
-            "USN journal reset during scan");
-        let from = if mode == ScanMode::Full { start.next_usn } else { previous.as_ref().unwrap().next_usn };
-        phase = "合并变化记录";
-        let mut changed = std::collections::HashMap::new();
-        let next_usn = volume.read_changes(from, endpoint.next_usn, start.id, |record| {
-            if cancelled() { anyhow::bail!("Scan cancelled"); }
-            if (record.id & 0x0000_ffff_ffff_ffff) < 16 { return Ok(()); }
-            merge_change(&mut changed, &record);
-            counters.journal_records += 1;
-            processed += 1;
-            if processed % 512 == 0 {
-                std::thread::yield_now();
-                load.wait_if_busy(cancelled, progress, phase, processed)?;
+    };
+    let saved=if let Some(saved)=saved {
+        if let Some(report)=store.published_task(&saved.state.task)? {
+            let same=saved.state.same_target(root,&verification,&volume_id,root_id,start.id);
+            drop(saved);scan_work::remove(&work_path)?;
+            if same {return Ok(report);}None
+        } else if saved.state.compatible(root,&previous,base_scan,&verification,&volume_id,root_id,start) {Some(saved)} else {
+            enforce_scan_policy(policy,scan_mode(previous.as_ref(),&volume_id,root_id,start).0)?;
+            drop(saved);scan_work::remove(&work_path)?;
+            resume_warning=Some("磁盘、日志或扫描基准已变化，重新采集本轮数据".into());None
+        }
+    } else {None};
+    let resumed=saved.is_some();
+    let mut work=if let Some(saved)=saved {saved} else {
+        let (mode,reason)=scan_mode(previous.as_ref(),&volume_id,root_id,start);
+        enforce_scan_policy(policy,mode)?;
+        let pending=if mode==ScanMode::Incremental {store.pending(root)?} else {vec![]};
+        let warnings=reason.into_iter().map(str::to_owned).chain(resume_warning).collect();
+        Work::create(&work_path,State::new(root,previous,base_scan,verification,&volume_id,root_id,start,mode,pending,warnings))?
+    };
+    let mode=work.state.mode;
+    enforce_scan_policy(policy,mode)?;
+    *counters=work.state.counters.clone();
+    let mut pending:HashSet<u64>=work.state.pending.iter().copied().collect();
+    let mut load=CpuLoad::new([Some(letter),store.database_drive()])?;
+    progress(ScanProgress {phase:if resumed {"继续已保存扫描"} else {"开始采集"}.into(),processed:work.state.processed,expected:0});
+
+    if !work.state.mft_done {
+        // Windows returns the next MFT enumeration cursor with each complete buffer.
+        // Commit its entries and cursor together, so a partial buffer is replayed.
+        if work.state.mft_cursor==0 {
+            work.begin()?;
+            counters.entry_reads+=1;
+            work.stage(Mutation::Upsert(read_entry(&ntfs,&mut reader,root_id)?.context("Root directory disappeared")?))?;
+            work.state.counters=counters.clone();work.save()?;
+        }
+        volume.enumerate_batches(work.state.mft_cursor,work.state.high_usn,|records,next| {
+            work.begin()?;
+            for record in records {
+                if cancelled() {anyhow::bail!("Scan cancelled");}
+                if record.id!=root_id && (record.id & 0x0000_ffff_ffff_ffff)>=16 {
+                    if let Some(mutation)=record_mutation(&ntfs,&mut reader,store,&volume_id,record.id,true,&mut pending,&mut counters.entry_reads)? {
+                        work.stage(mutation)?;
+                    }
+                }
+                work.state.processed+=1;
+                if work.state.processed%512==0 {load.wait_if_busy(cancelled,progress,"MFT",work.state.processed)?;}
             }
-            if processed % 4096 == 0 {
-                progress(ScanProgress { phase: "合并变化记录".into(), processed, expected: 0 });
-            }
-            Ok(())
+            work.state.mft_cursor=next;work.state.pending=pending.iter().copied().collect();
+            work.state.counters=counters.clone();work.save()?;
+            progress(ScanProgress {phase:"MFT · 进度已保存".into(),processed:work.state.processed,expected:0});
+            Ok(true)
         })?;
-        counters.unique_changed_files = changed.len() as u64;
-        phase = "读取变化文件";
-        progress(ScanProgress { phase: phase.into(), processed: 0, expected: changed.len() as u64 });
-        let expected = changed.len() as u64;
-        for (index, (id, deleted)) in changed.into_iter().enumerate() {
-            if cancelled() { anyhow::bail!("Scan cancelled"); }
-            // The complete reference number includes the MFT sequence, so reused slots stay distinct.
-            if deleted {
-                store.stage(Mutation::Delete(id))?;
-                pending.remove(&id);
-            } else {
-                reader.invalidate();
-                stage_record(&ntfs, &mut reader, store, &volume_id, id, false, &mut pending, &mut counters.entry_reads)?;
-            }
-            if index % 512 == 0 {
-                load.wait_if_busy(cancelled, progress, phase, index as u64)?;
-                progress(ScanProgress { phase: phase.into(), processed: index as u64 + 1, expected });
-            }
+        work.begin()?;work.state.mft_done=true;work.save()?;
+    }
+    reader.invalidate();
+    let endpoint=volume.journal()?;
+    ensure!(endpoint.id==start.id && endpoint.first_usn<=work.state.journal_cursor,"USN journal reset during scan");
+    volume.change_batches(work.state.journal_cursor,endpoint.next_usn,start.id,|records,next| {
+        work.begin()?;
+        for record in records {
+            if cancelled() {anyhow::bail!("Scan cancelled");}
+            if (record.id & 0x0000_ffff_ffff_ffff)<16 {continue;}
+            work.event(record.id,record.reason & 0x0000_0200!=0)?;
+            counters.journal_records+=1;work.state.processed+=1;
+            if work.state.processed%512==0 {load.wait_if_busy(cancelled,progress,"合并变化记录",work.state.processed)?;}
         }
-        for id in pending.iter().copied().collect::<Vec<_>>() {
-            if cancelled() { anyhow::bail!("Scan cancelled"); }
-            reader.invalidate();
-            stage_record(&ntfs, &mut reader, store, &volume_id, id,
-                mode == ScanMode::Full, &mut pending, &mut counters.entry_reads)?;
-        }
-        let mut tried_parents = HashSet::new();
-        loop {
-            let missing: Vec<_> = store.missing_parent_ids(&volume_id, mode == ScanMode::Full)?
-                .into_iter().filter(|id| tried_parents.insert(*id)).collect();
-            if missing.is_empty() { break; }
-            for id in missing {
-                load.wait_if_busy(cancelled, progress, "补全目录路径", processed)?;
-                counters.entry_reads += 1;
+        work.state.journal_cursor=next;work.state.counters=counters.clone();work.save()?;
+        progress(ScanProgress {phase:"合并变化记录 · 进度已保存".into(),processed:work.state.processed,expected:0});
+        Ok(())
+    })?;
+    counters.unique_changed_files=work.db.query_row("SELECT COUNT(*) FROM events",[],|r|r.get(0))?;
+    let mut remaining:u64=work.db.query_row("SELECT COUNT(*) FROM events WHERE processed=0",[],|r|r.get(0))?;
+    loop {
+        let events=work.events()?;
+        if events.is_empty() {break;}
+        let count=events.len() as u64;
+        work.begin()?;
+        for (id,deleted) in events {
+            if cancelled() {anyhow::bail!("Scan cancelled");}
+            if deleted {work.stage(Mutation::Delete(id))?;pending.remove(&id);} else {
                 reader.invalidate();
-                if let Ok(Some(entry)) = read_entry(&ntfs, &mut reader, id) {
-                    if entry.is_dir { store.stage(Mutation::Upsert(entry))?; }
+                if let Some(mutation)=record_mutation(&ntfs,&mut reader,store,&volume_id,id,false,&mut pending,&mut counters.entry_reads)? {
+                    work.stage(mutation)?;
                 }
             }
+            work.db.prepare_cached("UPDATE events SET processed=1 WHERE id=?")?.execute([id as i64])?;
         }
-        let after = volume.journal()?;
-        ensure!(after.id == start.id && after.first_usn <= next_usn,
-            "USN journal gap before commit");
-        if cancelled() { anyhow::bail!("Scan cancelled"); }
-        let (total, free) = disk_space(root)?;
-        let mut pending: Vec<_> = pending.iter().copied().collect();
-        pending.sort_unstable();
-        let retry_warning = (!pending.is_empty()).then(|| format!(
-            "{} 个 NTFS 文件记录的数据属性暂时无法读取，保留旧索引并在下次扫描重试（例如记录 {}）",
-            pending.len(), pending[0] & 0x0000_ffff_ffff_ffff));
-        Ok(ScanOutcome {
-            checkpoint: Checkpoint { volume_id, journal_id: start.id, next_usn, root_id },
-            mode, total, free, sampled_at: chrono::Local::now().to_rfc3339(), pending,
-            warnings: full_reason.into_iter().map(str::to_owned)
-                .chain(load.disk_warning().into_iter().map(str::to_owned))
-                .chain(retry_warning).collect(),
-        })
-    })();
-    match run {
-        Ok(outcome) => {
-            progress(ScanProgress { phase: "提交索引".into(), processed, expected: 0 });
-            store.commit_stage_control(root, &outcome, &mut ||
-                load.wait_if_busy(cancelled, progress, "提交索引", processed))
-        }
-        Err(error) => { store.discard_stage()?; Err(error) }
+        work.state.pending=pending.iter().copied().collect();work.state.counters=counters.clone();work.save()?;
+        remaining-=count;
+        let processed=counters.unique_changed_files-remaining;
+        load.wait_if_busy(cancelled,progress,"读取变化文件",processed)?;
+        progress(ScanProgress {phase:"读取变化文件 · 进度已保存".into(),processed,expected:counters.unique_changed_files});
     }
+    for batch in pending.iter().copied().collect::<Vec<_>>().chunks(512) {
+        work.begin()?;
+        for &id in batch {
+            if cancelled() {anyhow::bail!("Scan cancelled");}
+            reader.invalidate();
+            if let Some(mutation)=record_mutation(&ntfs,&mut reader,store,&volume_id,id,mode==ScanMode::Full,&mut pending,&mut counters.entry_reads)? {
+                work.stage(mutation)?;
+            }
+        }
+        work.state.pending=pending.iter().copied().collect();work.state.counters=counters.clone();work.save()?;
+        load.wait_if_busy(cancelled,progress,"重试文件属性",counters.entry_reads)?;
+    }
+    // Published nodes remain untouched while inputs are collected. The final
+    // transaction imports them and can roll back independently of saved work.
+    store.begin_stage()?;
+    let result=(|| {
+        work.import(store,cancelled)?;
+        let mut tried_parents=HashSet::new();
+        loop {
+            let missing:Vec<_>=store.missing_parent_ids(&volume_id,mode==ScanMode::Full)?
+                .into_iter().filter(|id|tried_parents.insert(*id)).collect();
+            if missing.is_empty() {break;}
+            work.begin()?;
+            for id in missing {
+                load.wait_if_busy(cancelled,progress,"补全目录路径",work.state.processed)?;
+                counters.entry_reads+=1;reader.invalidate();
+                if let Ok(Some(entry))=read_entry(&ntfs,&mut reader,id) {
+                    if entry.is_dir {
+                        work.stage(Mutation::Upsert(entry.clone()))?;store.stage(Mutation::Upsert(entry))?;
+                    }
+                }
+            }
+            work.state.counters=counters.clone();work.save()?;
+        }
+        let after=volume.journal()?;
+        ensure!(after.id==start.id && after.first_usn<=work.state.journal_cursor,"USN journal gap before commit");
+        if cancelled() {anyhow::bail!("Scan cancelled");}
+        let (total,free)=disk_space(root)?;
+        let mut pending:Vec<_>=pending.into_iter().collect();pending.sort_unstable();
+        let mut warnings=work.state.warnings.clone();
+        if let Some(warning)=load.disk_warning() {warnings.push(warning.into());}
+        if let Some(&id)=pending.first() {warnings.push(format!("{} 个 NTFS 文件记录的数据属性暂时无法读取，保留旧索引并在下次扫描重试（例如记录 {}）",pending.len(),id & 0x0000_ffff_ffff_ffff));}
+        let outcome=ScanOutcome {checkpoint:Checkpoint {volume_id,journal_id:start.id,next_usn:work.state.journal_cursor,root_id},
+            mode,total,free,sampled_at:chrono::Local::now().to_rfc3339(),pending,warnings};
+        store.set_scan_work(work.path.clone(),work.state.task.clone());
+        progress(ScanProgress {phase:"提交索引".into(),processed:work.state.processed,expected:0});
+        store.commit_stage_control(root,&outcome,&mut ||load.wait_if_busy(cancelled,progress,"目录统计与写入",work.state.processed))
+    })();
+    if result.is_err() {store.discard_stage()?;}
+    store.clear_scan_work();
+    if result.is_ok() {drop(work);if let Err(error)=scan_work::remove(&work_path) {eprintln!("扫描已保存，工作文件待回收：{error:#}");}}
+    result
 }
 
 fn missing_data_attribute(error: &anyhow::Error) -> bool {
@@ -340,13 +388,14 @@ fn missing_data_attribute(error: &anyhow::Error) -> bool {
         Some(NtfsError::AttributeNotFound { ty: NtfsAttributeType::Data, .. }))
 }
 
+#[cfg(test)]
 fn merge_change(changed: &mut std::collections::HashMap<u64, bool>, record: &UsnRecord) {
     let deleted = record.reason & 0x0000_0200 != 0;
     changed.entry(record.id).and_modify(|value| *value |= deleted).or_insert(deleted);
 }
 
-fn stage_record(ntfs: &Ntfs, reader: &mut AlignedReader, store: &mut Store,
-    volume: &str, id: u64, full: bool, pending: &mut HashSet<u64>, reads: &mut u64) -> Result<()> {
+fn record_mutation(ntfs: &Ntfs, reader: &mut AlignedReader, store: &Store,
+    volume: &str, id: u64, full: bool, pending: &mut HashSet<u64>, reads: &mut u64) -> Result<Option<Mutation>> {
     *reads += 1;
     let mut result = read_entry(ntfs, reader, id);
     if result.as_ref().is_err_and(missing_data_attribute) {
@@ -356,24 +405,24 @@ fn stage_record(ntfs: &Ntfs, reader: &mut AlignedReader, store: &mut Store,
     }
     match result {
         Ok(Some(entry)) => {
-            store.stage(Mutation::Upsert(entry))?;
             pending.remove(&id);
+            Ok(Some(Mutation::Upsert(entry)))
         }
         Ok(None) => {
-            store.stage(Mutation::Delete(id))?;
             pending.remove(&id);
+            Ok(Some(Mutation::Delete(id)))
         }
         Err(error) if missing_data_attribute(&error) => {
             pending.insert(id);
             if full {
                 if let Some(previous) = store.indexed_entry(volume, id)? {
-                    store.stage(Mutation::Upsert(previous))?;
+                    return Ok(Some(Mutation::Upsert(previous)));
                 }
             }
+            Ok(None)
         }
-        Err(error) => return Err(error).with_context(|| format!("Read NTFS record {}", id & 0x0000_ffff_ffff_ffff)),
+        Err(error) => Err(error).with_context(|| format!("Read NTFS record {}", id & 0x0000_ffff_ffff_ffff)),
     }
-    Ok(())
 }
 
 fn scan_mode(previous: Option<&Checkpoint>, volume_id: &str, root_id: u64, journal: Journal) -> (ScanMode, Option<&'static str>) {

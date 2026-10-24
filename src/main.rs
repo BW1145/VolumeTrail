@@ -86,6 +86,11 @@ fn main() -> Result<()> {
             worker::stop_scan(&data, letter.chars().next().unwrap())?;
             println!("Stop requested for {root}");
         }
+        "discard-scan" => {
+            let data=worker::data_dir()?;
+            worker::discard_saved_scan(&data,letter.chars().next().unwrap())?;
+            println!("Saved scan work discarded for {root}; completed history retained");
+        }
         "reports" => {
             let data = worker::data_dir()?;
             let store = volumetrail::store::Store::open(&worker::store_path(&data))?;
@@ -106,6 +111,10 @@ fn main() -> Result<()> {
             for table in ["nodes", "folders", "staging", "changes", "scans"] {
                 let count: u64 = db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))?;
                 println!("{table}: {count} rows");
+            }
+            if db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? >= 12 {
+                let count: i64 = db.query_row("SELECT COALESCE(SUM(entries),0) FROM change_archives", [], |row| row.get(0))?;
+                println!("compressed changes: {count} rows");
             }
             let mut stmt = db.prepare("SELECT name,SUM(pgsize),SUM(payload) FROM dbstat GROUP BY name ORDER BY SUM(pgsize) DESC")?;
             let mut rows = stmt.query([])?;

@@ -10,11 +10,11 @@ SQLite and configuration live beside the executable in `data/`.
 
 - Scan summaries retain sample time, completion time, disk capacity/free space,
   indexed bytes and file count. The chart can show 7, 30, 365 days or all points.
-- History budget first removes per-file detail and then directory aggregates,
-  oldest first. It measures the pages used by these history tables and their
-  indexes; the current index, scan summaries, performance and migration backups
-  have separate storage totals. Small scan summaries and the current index remain. The UI can
-  clear selected details or delete selected scan points.
+- Older per-file details use lossless compressed chunks; the latest scan per
+  volume stays directly queryable. Scan summaries, details, directory and type
+  aggregates are retained automatically. The current index stores each field once.
+  Storage totals distinguish index, history and migration backups. The UI can
+  explicitly clear selected details or delete selected scan points.
 - Deleting an intermediate point merges its directory interval into the next
   retained interval. Deleting the latest point carries its interval into the
   next scan. Comparison coverage is shown when aggregates or details are absent.

@@ -6,14 +6,13 @@ use std::{collections::HashSet, fs, io::ErrorKind, path::Path};
 #[serde(default)]
 pub struct AppConfig {
     pub drives: Vec<char>,
-    pub history_budget_mib: u64,
     pub close_after_manual_scan: bool,
     pub trend_days: u16,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        Self { drives: vec!['C'], history_budget_mib: 512, close_after_manual_scan: false, trend_days: 30 }
+        Self { drives: vec!['C'], close_after_manual_scan: false, trend_days: 30 }
     }
 }
 
@@ -36,10 +35,7 @@ impl AppConfig {
         Ok(())
     }
 
-    pub fn budget_bytes(&self) -> u64 { self.history_budget_mib * 1024 * 1024 }
-
     fn validate(&self) -> Result<()> {
-        ensure!((64..=4096).contains(&self.history_budget_mib), "History budget must be 64-4096 MiB");
         ensure!([0, 7, 30, 365].contains(&self.trend_days), "Trend range must be 7, 30, 365 days or all time");
         ensure!(!self.drives.is_empty(), "Choose at least one drive");
         let mut seen = HashSet::new();
@@ -55,10 +51,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn configuration_persists_drive_selection_and_budget() {
+    fn configuration_persists_drive_selection_and_preferences() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(AppConfig::load(dir.path()).unwrap(), AppConfig::default());
-        let config = AppConfig { drives: vec!['C', 'E'], history_budget_mib: 768, close_after_manual_scan: true, trend_days: 365 };
+        let config = AppConfig { drives: vec!['C', 'E'], close_after_manual_scan: true, trend_days: 365 };
         config.save(dir.path()).unwrap();
         assert_eq!(AppConfig::load(dir.path()).unwrap(), config);
         assert!(AppConfig { drives: vec!['C', 'C'], ..config }.save(dir.path()).is_err());

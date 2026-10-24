@@ -28,6 +28,17 @@ struct PendingClose {
     launched: Instant,
 }
 
+struct ScanLaunch {
+    drive: char,
+    requested: Instant,
+    last_report_id: i64,
+    error: Option<String>,
+}
+
+impl ScanLaunch {
+    fn waiting(&self) -> bool { self.requested.elapsed() < Duration::from_secs(5) }
+}
+
 pub struct VolumeTrailApp {
     cleanup_state: cleanup::CleanupState,
     overview_state: overview::OverviewState,
@@ -67,7 +78,7 @@ pub struct VolumeTrailApp {
     status: Option<worker::ScanStatus>,
     running: bool,
     any_running: bool,
-    scan_launch_at: Option<Instant>,
+    scan_launch: Option<ScanLaunch>,
     close_after_scan: Option<PendingClose>,
     error: Option<String>,
     startup_status: Option<Result<StartupStatus, String>>,
@@ -116,7 +127,7 @@ impl VolumeTrailApp {
             folders: Vec::new(), largest_mode: None, largest_items: Vec::new(),
             largest_offset: 0, largest_key: None, largest_rx: None,
             breadcrumbs: Vec::new(), folder_volume: None,
-            status: None, running: false, any_running: false, scan_launch_at: None,
+            status: None, running: false, any_running: false, scan_launch: None,
             close_after_scan: None, error: None,
             startup_status: None, startup_rx: None, startup_refresh_at: None,
             storage_usage: None, storage_rx: None,
@@ -158,8 +169,13 @@ impl VolumeTrailApp {
         self.status = worker::read_status(&self.data, self.drive);
         self.running = worker::is_running(&self.data, self.drive);
         self.any_running = worker::is_any_running(&self.data);
-        if self.scan_launch_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(5)) {
-            self.scan_launch_at = None;
+        if let Some(launch) = &self.scan_launch {
+            let started = worker::is_running(&self.data, launch.drive);
+            let completed = worker::read_status(&self.data, launch.drive).is_some_and(|status|
+                status.finished && status.report_id.is_some_and(|id| id > launch.last_report_id));
+            if started || completed || (!launch.waiting() && launch.error.is_none()) {
+                self.scan_launch = None;
+            }
         }
         self.last_refresh = Instant::now();
     }
@@ -330,29 +346,31 @@ impl VolumeTrailApp {
                     }
                 });
             ui.separator();
-            if ui.add_enabled(!self.any_running && self.scan_launch_at.is_none(),
-                egui::Button::new("开始扫描")).clicked() {
+            let saved=worker::has_saved_scan(&self.data,self.drive);
+            if ui.add_enabled(!self.any_running && !self.scan_launch.as_ref().is_some_and(ScanLaunch::waiting),
+                egui::Button::new(if saved {"继续扫描"} else {"开始扫描"})).clicked() {
                 if worker::is_any_running(&self.data) {
                     self.any_running = true;
                 } else {
-                    match worker::start_elevated_scan(self.drive) {
-                        Ok(()) => {
-                            self.scan_launch_at = Some(Instant::now());
-                            if self.config.close_after_manual_scan {
-                                let root = format!("{}:\\", self.drive);
-                                let last_report_id = self.reports.iter().find(|report| report.root == root)
-                                    .map_or(0, |report| report.id);
-                                self.close_after_scan = Some(PendingClose {
-                                    drive: self.drive, last_report_id, started: false, launched: Instant::now(),
-                                });
-                            }
-                        }
-                        Err(error) => self.error = Some(format!("启动扫描失败：{error:#}")),
+                    let root = format!("{}:\\", self.drive);
+                    let last_report_id = self.reports.iter().find(|report| report.root == root).map_or(0, |report| report.id);
+                    let error = worker::start_elevated_scan(self.drive).err().map(|error| format!("启动扫描失败：{error:#}"));
+                    // Give the worker time to take its lock before trusting the launcher result.
+                    self.scan_launch = Some(ScanLaunch { drive: self.drive, requested: Instant::now(), last_report_id, error });
+                    if self.config.close_after_manual_scan {
+                        self.close_after_scan = Some(PendingClose {
+                            drive: self.drive, last_report_id, started: false, launched: Instant::now(),
+                        });
                     }
                 }
             }
+            if saved && !self.any_running && ui.button("放弃本轮进度").clicked() {
+                if let Err(error)=worker::discard_saved_scan(&self.data,self.drive) {
+                    self.error=Some(format!("放弃进度失败：{error:#}"));
+                }
+            }
             if self.any_running && !self.running { ui.label("其他磁盘正在扫描"); }
-            else if self.scan_launch_at.is_some() && !self.running { ui.label("正在启动扫描"); }
+            else if self.scan_launch.as_ref().is_some_and(ScanLaunch::waiting) && !self.running { ui.label("正在启动扫描"); }
             if ui.button("刷新").clicked() { self.comparison_key = None; self.refresh(); }
         });
         if self.running {
@@ -370,7 +388,7 @@ impl VolumeTrailApp {
                             ui.label(format!("{} · 已处理 {} 项", phase, processed));
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("停止本次扫描").clicked() {
+                            if ui.button("暂停并保存进度").clicked() {
                                 if let Err(error) = worker::stop_scan(&self.data, self.drive) {
                                     self.error = Some(format!("停止失败：{error:#}"));
                                 }
@@ -393,6 +411,11 @@ impl VolumeTrailApp {
         }
         if let Some(error) = &self.error {
             ui.colored_label(RED, error);
+        }
+        if let Some(launch) = &self.scan_launch {
+            if launch.drive == self.drive && !launch.waiting() {
+                if let Some(error) = &launch.error { ui.colored_label(RED, error); }
+            }
         }
         ui.separator();
     }
@@ -703,10 +726,7 @@ impl VolumeTrailApp {
             }
         });
         ui.add_space(14.0);
-        ui.horizontal(|ui| {
-            ui.label("历史明细和目录汇总上限");
-            ui.add(egui::DragValue::new(&mut self.config.history_budget_mib).range(64..=4096).speed(16.0).suffix(" MiB"));
-        });
+        ui.label("历史明细自动无损压缩，扫描记录和汇总持续保留。");
         ui.add_space(8.0);
         ui.strong("存储占用");
         match &self.storage_usage {
@@ -862,6 +882,50 @@ impl eframe::App for VolumeTrailApp {
 fn metric(ui: &mut egui::Ui, title: &str, value: u64, color: Color32) {
     ui.label(RichText::new(title).color(MUTED));
     ui.label(RichText::new(bytes(value)).size(22.0).color(color));
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+
+    fn app(data: &Path) -> VolumeTrailApp {
+        let mut app = VolumeTrailApp::new(&egui::Context::default(), data.to_path_buf()).unwrap();
+        app.scan_launch = Some(ScanLaunch { drive: 'C', requested: Instant::now() - Duration::from_secs(6),
+            last_report_id: 7, error: Some("启动扫描失败：launcher reported failure".into()) });
+        app
+    }
+
+    #[test]
+    fn running_scan_clears_launch_error_and_preserves_unrelated_error() {
+        let dir = tempfile::tempdir().unwrap(); let mut app = app(dir.path());
+        app.error = Some("unrelated database error".into());
+        let _scan = worker::scan_lock(dir.path(), 'C').unwrap();
+        app.refresh_status();
+        assert!(app.running);
+        assert!(app.scan_launch.is_none());
+        assert_eq!(app.error.as_deref(), Some("unrelated database error"));
+    }
+
+    #[test]
+    fn failed_launch_remains_visible_without_a_worker_or_new_result() {
+        let dir = tempfile::tempdir().unwrap(); let mut app = app(dir.path());
+        worker::write_status(dir.path(), 'C', &worker::ScanStatus {
+            root: "C:\\".into(), finished: true, report_id: Some(7), ..Default::default()
+        }).unwrap();
+        app.refresh_status();
+        assert!(!app.scan_launch.as_ref().unwrap().waiting());
+        assert!(app.scan_launch.as_ref().unwrap().error.is_some());
+    }
+
+    #[test]
+    fn quickly_completed_scan_clears_launch_error_between_ui_polls() {
+        let dir = tempfile::tempdir().unwrap(); let mut app = app(dir.path());
+        worker::write_status(dir.path(), 'C', &worker::ScanStatus {
+            root: "C:\\".into(), finished: true, report_id: Some(8), ..Default::default()
+        }).unwrap();
+        app.refresh_status();
+        assert!(app.scan_launch.is_none());
+    }
 }
 
 fn folder_growth_row(ui: &mut egui::Ui, item: &FolderGrowth, color: Color32) -> (bool, bool) {

@@ -11,3 +11,4 @@ pub mod cleanup;
 mod atomic;
 pub mod worker_cleanup;
 pub mod capabilities;
+mod scan_work;
